@@ -1,0 +1,6 @@
+# build artifacts
+payload-src/build/
+*.log
+
+# macOS
+.DS_Store
