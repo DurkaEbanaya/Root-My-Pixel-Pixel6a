@@ -198,6 +198,56 @@ PY
 
 ---
 
+## Zip-модули KernelSU — без перезагрузки
+
+Перезагрузка в нашей схеме **запрещена и не нужна**: root и LKM живут только до ребута, а «перезагрузку для модулей» полностью заменяет ручной запуск бут-стадий `ksud`. Проверено на устройстве: zip-модуль устанавливается, монтируется поверх `/system` через OverlayFS и виден приложениям.
+
+### Шаг 0: метамодуль (обязателен)
+
+В KSUN v3.3.0 монтирование вынесено в отдельный «метамодуль». Без него модули ставятся, но **не монтируются**. Официальный — [meta-overlayfs](https://github.com/KernelSU-Modules-Repo/meta-overlayfs) (v1.3.1):
+
+```bash
+adb push meta-overlayfs-13100-1.3.1.zip /data/local/tmp/
+adb shell "echo '/data/local/tmp/ksud module install /data/local/tmp/meta-overlayfs-13100-1.3.1.zip' \
+    | /data/local/tmp/ksud debug su"
+# активация метамодуля (один раз после его установки):
+adb shell "echo '/data/local/tmp/ksud post-fs-data' | /data/local/tmp/ksud debug su"
+```
+
+### Шаг 1: установка и монтирование модуля
+
+```bash
+adb push mymodule.zip /data/local/tmp/
+adb shell "echo '/data/local/tmp/ksud module install /data/local/tmp/mymodule.zip' \
+    | /data/local/tmp/ksud debug su"       # metainstall.sh метамодуля сложит контент в ext4-образ
+adb shell "echo '/data/local/tmp/ksud post-fs-data' \
+    | /data/local/tmp/ksud debug su"       # вот он — «ребут для модулей»: OverlayFS поверх /system
+adb shell "echo '/data/local/tmp/ksud services' | /data/local/tmp/ksud debug su"          # опционально
+adb shell "echo '/data/local/tmp/ksud boot-completed' | /data/local/tmp/ksud debug su"    # опционально
+```
+
+Проверка (из нового процесса — новый shell, новое приложение):
+
+```bash
+adb shell mount | grep KSU
+# KSU on /system type overlay (ro,seclabel,relatime,lowerdir=.../mnt/<id>/system:/system)
+```
+
+### Как это работает
+
+- `ksud module install` без метамодуля кладёт zip в `/data/adb/modules/`; с метамодулем контент дополнительно копируется в его ext4-образ (`/data/adb/modules/meta-overlayfs/mnt/`).
+- `ksud post-fs-data` — та самая стадия, которая на обычных устройствах выполняется при загрузке до старта zygote: обрабатывает обновления модулей и запускает `metamount.sh` → OverlayFS поверх `/system`, `/vendor` и т.д.
+- Монтирование происходит в namespace init и **видно zygote** — все новые приложения получают файлы модуля. Уже запущенные приложения увидят изменения после своего перезапуска.
+- `ksud soft-reboot` (осторожно, убивает все приложения) перезапускает только zygote/framework: `stop` → стадии → `start`, ядро и LKM не трогаются — штатный способ «перезагрузки» без потери root.
+
+### Нюансы
+
+- Первая установка модуля сразу после установки метамодуля блокируется («Metamodule installation blocked») — метамодуль находится в состоянии update; один `post-fs-data` стабилизирует состояние.
+- Живые mount'ы не откатываются при uninstall модуля до перезагрузки — файлы могут оставаться видимыми; после ребута всё чисто.
+- Скрипты модуля — `post-fs-data.sh`, `service.sh`, `boot-completed.sh` в **корне** модуля (не в `*.d/`-подкаталогах: те относятся только к общим `/data/adb/*.d`).
+
+---
+
 ## Структура репозитория
 
 ```
