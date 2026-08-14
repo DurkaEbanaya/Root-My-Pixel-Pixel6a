@@ -134,6 +134,70 @@ make TARGET=bluejay-CP1A.260405.005
 
 ---
 
+## KernelSU Next (LKM) поверх root
+
+Поверх полученного root можно загрузить **KernelSU Next v3.3.0** как LKM-модуль — менеджер показывает «Работает», а root выдаётся в домене `u:r:ksu:s0` уже при SELinux Enforcing.
+
+### Почему нужен патч модуля
+
+Готовые `.ko` из релизов KernelSU-Next рассчитаны на GKI-ядра, где нужные символы (`selinux_state`, `policydb_*` и т.д.) экспортированы. Ядро Pixel 6a (GS101, `6.1.145-android14-11`) эти символы **содержит, но не экспортирует** — поэтому `insmod` релизного модуля падает с `Unknown symbol`.
+
+Решение: перед загрузкой пропатчить ELF модуля — все неопределённые импорты (`SHN_UNDEF`) превращаются в абсолютные символы (`SHN_ABS`) с реальными адресами ядра = `адрес_из_kallsyms + KASLR_slide`. Ядру тогда вообще не нужно искать экспорты.
+
+### Один прогон — всё сразу
+
+```bash
+pip3 install pyelftools
+./ksun/ksun_pipeline.sh        # reboot -> эксплойт -> патч -> insmod -> проверка
+```
+
+Скрипт сам: перезагружает телефон, запускает эксплойт, берёт KASLR slide из лога пейлоада (`slide=...`), патчит `ksun/android14-6.1_kernelsu_v3.3.0.ko` и загружает его с `allow_shell=1`.
+
+Результат:
+
+```
+kernelsu 319488 0 - Live        # модуль в ядре
+Работает / LKM (GKI2)           # менеджер KernelSU Next
+$ ksud debug su                 # root-шелл
+uid=0(root) ... context=u:r:ksu:s0
+```
+
+### Файлы
+
+- `ksun/ksun_pipeline.sh` — полный конвейер (см. выше)
+- `ksun/patch_ko.py` — патчер ELF: `UND → ABS` по таблице символов
+- `ksun/bluejay-CP1A.260405.005.ksym.tsv` — link-адреса всех 102 086 символов ядра (извлечены из `boot.img` сборки `15001963` через `vmlinux-to-elf`)
+- `ksun/android14-6.1_kernelsu_v3.3.0.ko` — оригинальный релизный модуль KernelSU-Next
+
+Требуется установленный менеджер [KernelSU-Next v3.3.0](https://github.com/KernelSU-Next/KernelSU-Next/releases) (com.rifsxd.ksunext) и `ksud` из того же релиза, запушенный в `/data/local/tmp/ksud`.
+
+### Как получена таблица символов
+
+```bash
+# boot.img снят с самого устройства (слот b):
+adb shell 'su dd if=/dev/block/by-name/boot_b of=/data/local/tmp/boot_b.img'
+adb pull /data/local/tmp/boot_b.img
+# из него — kernel Image (boot header v4), затем:
+pip3 install vmlinux-to-elf pyelftools
+vmlinux-to-elf kernel.img kernel.elf     # найдёт kallsyms: base ffffffc008000000
+python3 - <<'PY'                          # выгрузка .symtab в ksym.tsv
+from elftools.elf.elffile import ELFFile
+e = ELFFile(open('kernel.elf','rb')); s = e.get_section_by_name('.symtab')
+out = open('bluejay-CP1A.260405.005.ksym.tsv','w')
+for sym in s.iter_symbols():
+    if sym.name and sym['st_value']:
+        out.write(f"{sym['st_value']:016x}\t{sym.name}\n")
+PY
+```
+
+### Ограничения
+
+- Slide меняется при каждой загрузке — патч делается заново (pipeline это делает автоматически).
+- KSUN в late-load сам возвращает SELinux в Enforcing — это штатное поведение; temp-su демон из эксплойта после этого недоступен (используйте `ksud debug su`).
+- Всё по-прежнему живёт до перезагрузки: после ребута повторите `ksun_pipeline.sh`.
+
+---
+
 ## Структура репозитория
 
 ```
@@ -141,7 +205,8 @@ make TARGET=bluejay-CP1A.260405.005
 ├── binaries/
 │   ├── cve-2026-43499-app.so   # готовый пейлоад (сборка bluejay-CP1A.260405.005)
 │   └── cve-2026-43499-root     # готовый хелпер: запуск пейлоада + su-демон
-└── payload-src/                # исходники пейлоада (src/61/*, targets/, Makefile)
+├── payload-src/                # исходники пейлоада (src/61/*, targets/, Makefile)
+└── ksun/                       # KernelSU-Next LKM: патчер, pipeline, символы ядра, .ko
 ```
 
 ---

@@ -4,3 +4,7 @@ payload-src/build/
 
 # macOS
 .DS_Store
+
+# generated per-run artifacts
+kernel-log.txt
+ksun/kernelsu-patched.ko
