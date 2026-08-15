@@ -74,8 +74,8 @@ release: $(APP_RELEASE)
 $(OUTDIR):
 	mkdir -p $@
 
-$(ROOT_HELPER): src/su_daemon.c | $(OUTDIR)
-	$(TARGET_CC) -fPIE -pie -O2 -g0 -Wall -Wextra $< -ldl -o $@
+$(ROOT_HELPER): src/su_daemon.c src/ksu_load.c src/ksu_blob.h | $(OUTDIR)
+	$(TARGET_CC) -fPIE -pie -O2 -g0 -Wall -Wextra src/su_daemon.c src/ksu_load.c -ldl -o $@
 
 $(APP_PRELOAD): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h $(COMMON_DEPS) | $(OUTDIR)
 	$(TARGET_CC) -DAPP_PAYLOAD=1 -fPIC $(COMMON_CFLAGS) $(APP_PRELOAD_SRCS) \

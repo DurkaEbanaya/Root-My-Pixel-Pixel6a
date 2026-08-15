@@ -248,15 +248,42 @@ adb shell mount | grep KSU
 
 ---
 
+## Без ПК: root + KernelSU-Next одним нажатием (форк Root My Pixel)
+
+Всё то же самое — эксплойт, ELF-патч LKM под текущий KASLR-слайд, `insmod`, бут-стадии KSU и монтирование модулей — умеет делать **модифицированное приложение Root My Pixel**, без компьютера и без adb. Единственное требование — работающий Shizuku (запускается на самом устройстве через «Беспроводную отладку», root не нужен).
+
+Готовый APK: см. [Releases](https://github.com/DurkaEbanaya/Root-My-Pixel-Pixel6a/releases) (`root-my-pixel-pixel6a-debug.apk`). Исходники — форк [alex193a/Root-My-Pixel](https://github.com/alex193a/Root-My-Pixel); diff приложения лежит в `app-fork-root-my-pixel.patch` (применяется поверх апстрима, свои бинарники кладутся в `app/src/main/assets/exploits/`, `assets/ksud/` и `jniLibs/arm64-v8a/libcve43499root.so`).
+
+### Что добавлено в приложение
+
+- **Кнопка Install** гоняет полный конвейер через Shizuku (uid 2000): наш пейлоад → su-демон → staging `ksud` → `libcve43499root.so --ksu-full` (патч .ko по слайду из лога эксплойта, `insmod`, `post-fs-data`/`services`/`boot-completed`, перезапуск менеджера KSUN).
+- **Кнопка Mount KSU modules** повторяет бут-стадии для уже живого LKM — это «ребут для модулей» без перезагрузки: установил zip-модуль через менеджер/`ksud`, нажал Mount — получил OverlayFS поверх `/system`.
+- Детект живого LKM через Shizuku (`grep kernelsu /proc/modules`): в LKM-режиме нет `/dev/kernelsu`, а `/data/adb` закрыт для untrusted-приложения.
+- Эксплойту передаётся `PSELECT_ACCEPT_NONREADY_CFI=1` — тот же флаг, что и в `run_exploit.py`; без него маршрут pselect бракуется по «quality miss» и root не получается.
+
+### Порядок действий (полностью на устройстве)
+
+1. Перезагрузите Pixel (эксплойту нужен свежий uptime, ориентир — до 5 минут).
+2. Запустите Shizuku через «Беспроводную отладку»: Настройки → Для разработчиков → Беспроводная отладка → «Подключить устройство к сети отладки»… затем в Shizuku «Start via Wireless debugging» (пейринг по коду с того же экрана). Один раз на загрузку.
+3. Откройте Root My Pixel (форк), разрешите доступ к Shizuku («Разрешить всегда»).
+4. Нажмите **Install** — подождите 3–5 минут, не сворачивая приложение (reclaim-фаза прожорлива, фоновый процесс может быть убит).
+5. По завершении менеджер KernelSU-Next сам откроется с статусом «Работает» (LKM GKI2, Jailbreak).
+6. Zip-модули: установите их в менеджере KSUN, затем в Root My Pixel нажмите **Mount KSU modules** — изменения появятся в `/system` без перезагрузки.
+
+После каждой перезагрузки устройства root и LKM сбрасываются (bootloader залочен, ничего не прошивается) — повторите шаги 1–4.
+
+---
+
 ## Структура репозитория
 
 ```
 ├── run_exploit.py              # скрипт запуска (заливает бинарники, запускает, показывает прогресс)
 ├── binaries/
 │   ├── cve-2026-43499-app.so   # готовый пейлоад (сборка bluejay-CP1A.260405.005)
-│   └── cve-2026-43499-root     # готовый хелпер: запуск пейлоада + su-демон
-├── payload-src/                # исходники пейлоада (src/61/*, targets/, Makefile)
-└── ksun/                       # KernelSU-Next LKM: патчер, pipeline, символы ядра, .ko
+│   └── cve-2026-43499-root     # готовый хелпер: запуск пейлоада + su-демон + --ksu-full/--ksu-mount
+├── payload-src/                # исходники пейлоада (src/61/*, targets/, Makefile, ksu_load.c)
+├── ksun/                       # KernelSU-Next LKM: патчер, pipeline, символы ядра, .ko
+└── app-fork-root-my-pixel.patch # diff приложения Root My Pixel (без-ПК режим)
 ```
 
 ---

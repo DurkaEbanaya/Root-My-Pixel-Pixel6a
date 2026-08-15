@@ -1058,5 +1058,13 @@ int main(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "--umh") == 0) {
     return umh_main(argc, argv);
   }
+  if (argc >= 2 && strcmp(argv[1], "--ksu-full") == 0) {
+    extern int ksu_full_main(int, char **);
+    return ksu_full_main(argc, argv);
+  }
+  if (argc >= 2 && strcmp(argv[1], "--ksu-mount") == 0) {
+    extern int ksu_mount_main(int, char **);
+    return ksu_mount_main(argc, argv);
+  }
   return client_main(argc, argv);
 }
