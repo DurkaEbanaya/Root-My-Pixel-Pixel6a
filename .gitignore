@@ -1,0 +1,13 @@
+# build artifacts
+payload-src/build/
+*.log
+
+# macOS
+.DS_Store
+
+# generated per-run artifacts
+kernel-log.txt
+ksun/kernelsu-patched.ko
+tools/carrier-unlock/build/
+tools/carrier-unlock/carrier-unlock.jar
+tools/carrier-unlock/__pycache__/

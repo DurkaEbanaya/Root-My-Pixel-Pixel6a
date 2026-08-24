@@ -1,0 +1,460 @@
+diff --git a/app/src/main/kotlin/com/alex193a/rootmypixel/feature/install/InstallViewModel.kt b/app/src/main/kotlin/com/alex193a/rootmypixel/feature/install/InstallViewModel.kt
+index cfb2720..b282e75 100644
+--- a/app/src/main/kotlin/com/alex193a/rootmypixel/feature/install/InstallViewModel.kt
++++ b/app/src/main/kotlin/com/alex193a/rootmypixel/feature/install/InstallViewModel.kt
+@@ -178,17 +178,23 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
+                 appendLog("[*] Using Shizuku shell access: $useShizuku")
+ 
+                 setPhase(InstallPhase.Exploiting, app.getString(R.string.status_exploit))
+-                executeExploit(payloads)
++                val handle = bindExploitService()
++                    ?: throw IllegalStateException("Failed to bind Shizuku UserService")
++                try {
++                    executeExploitViaShizuku(payloads, handle)
+ 
+-                if (permissiveOnly) {
+-                    setPhase(InstallPhase.Installed, "SELinux permissive + root shell ready")
+-                    appendLog("Install complete — permissive mode, KernelSU skipped")
+-                } else {
+-                    setPhase(InstallPhase.LoadingKernelSu, app.getString(R.string.status_loading_ksu))
+-                    installKernelSu(payloads)
++                    if (permissiveOnly) {
++                        setPhase(InstallPhase.Installed, "SELinux permissive + root shell ready")
++                        appendLog("Install complete — permissive mode, KernelSU skipped")
++                    } else {
++                        setPhase(InstallPhase.LoadingKernelSu, app.getString(R.string.status_loading_ksu))
++                        installKernelSu(payloads, handle)
+ 
+-                    setPhase(InstallPhase.Installed, app.getString(R.string.status_ksu_active))
+-                    appendLog(app.getString(R.string.log_install_complete))
++                        setPhase(InstallPhase.Installed, app.getString(R.string.status_ksu_active))
++                        appendLog(app.getString(R.string.log_install_complete))
++                    }
++                } finally {
++                    unbindExploitService(handle)
+                 }
+             } catch (error: Throwable) {
+                 if (error is CancellationException) throw error
+@@ -257,25 +263,21 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
+ 
+     // --- Exploit execution ---
+ 
+-    private suspend fun executeExploit(payloads: VerifiedPayloads) {
+-        executeExploitViaShizuku(payloads)
++    private suspend fun executeExploit(payloads: VerifiedPayloads, handle: ShizukuServiceHandle) {
++        executeExploitViaShizuku(payloads, handle)
+         appendLog(app.getString(R.string.log_bootstrap_root))
+     }
+ 
+-    private suspend fun executeExploitViaShizuku(payloads: VerifiedPayloads) {
++    private suspend fun executeExploitViaShizuku(payloads: VerifiedPayloads, handle: ShizukuServiceHandle) {
+         val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+         require(helper.exists()) { app.getString(R.string.error_helper_unavailable) }
+ 
+-        val handle = bindExploitService()
+-            ?: throw IllegalStateException("Failed to bind Shizuku UserService")
+-
+-        try {
+-            val logPrefix = mutableState.value.log
+-            handle.service.startExploit(
+-                payloads.exploit.readBytes(),
+-                helper.readBytes(),
+-                "/data/local/tmp/exploit.log",
+-            )
++        val logPrefix = mutableState.value.log
++        handle.service.startExploit(
++            payloads.exploit.readBytes(),
++            helper.readBytes(),
++            "/data/local/tmp/exploit.log",
++        )
+ 
+             val startedAt = SystemClock.elapsedRealtime()
+             var lastProgressAt = startedAt
+@@ -313,9 +315,6 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
+             require(finalLog.contains("done=1") && finalLog.contains("root=1")) {
+                 app.getString(R.string.error_success_marker)
+             }
+-        } finally {
+-            unbindExploitService(handle)
+-        }
+     }
+ 
+     // Shizuku helpers
+@@ -333,27 +332,28 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
+ 
+     // --- KernelSU ---
+ 
+-    private fun installKernelSu(payloads: VerifiedPayloads) {
++    private fun installKernelSu(payloads: VerifiedPayloads, handle: ShizukuServiceHandle) {
+         val ksudSource = payloads.kernelSu.absolutePath
+-        val ksudDest = "/data/local/tmp/ksud-pixel"
++        val ksudDest = "/data/local/tmp/ksud"
+         val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+ 
+         // 1. Wait for daemon to be ready
+         awaitDaemonSocket()
+-        diagnoseDaemon()
+ 
+-        // 2. Stage ksud via daemon root (cp + chmod + chown)
+-        appendLog("[*] Staging ReSukiSU binary...")
+-        val stageCmd = "cp '$ksudSource' $ksudDest && chmod 755 $ksudDest && " +
+-            "chown root:root $ksudDest"
++        // 2. Stage ksud via daemon root (runs while SELinux is still permissive).
++        // su client protocol: argv after the helper is joined with spaces and
++        // run as `sh -c <joined>` by the daemon, so the whole command must be
++        // passed as one single-quoted argument and must not contain quotes.
++        appendLog("[*] Staging KernelSU-Next ksud...")
++        val stageCmd = "cp $ksudSource $ksudDest && chmod 755 $ksudDest"
+         var stageSuccess = false
+         for (attempt in 1..5) {
+-            val result = runHelper(helper, "-c", stageCmd)
++            val result = runHelper(helper, "sh", "-c", "'$stageCmd'")
+             if (result.code == 0) {
+-                val verify = runHelper(helper, "-c", "ls -la $ksudDest")
++                val verify = runHelper(helper, "sh", "-c", "'ls -la $ksudDest'")
+                 if (verify.output.contains("rwxr-xr-x") ||
+                     verify.output.contains("-rwxr-xr-x")) {
+-                    appendLog("ReSukiSU staged: ${verify.output.trim()}")
++                    appendLog("[+] ksud staged: ${verify.output.trim()}")
+                     stageSuccess = true
+                     break
+                 }
+@@ -365,35 +365,23 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
+             app.getString(R.string.error_ksu_stage, "stage failed after 5 attempts")
+         }
+ 
+-        // 3. Execute late-load via daemon root
+-        appendLog("[*] Triggering KernelSU late-load (kmi=${payloads.kmi})...")
+-        val lateResult = runHelper(helper, "-c",
+-            "$ksudDest late-load --kmi ${payloads.kmi}")
+-        if (lateResult.output.isNotBlank()) {
+-            appendLog(lateResult.output.take(2000))
++        // 3. Run the on-device KSU loader: patch the .ko with the current
++        // KASLR slide, insmod it, then run the ksud boot stages so that
++        // installed zip-modules get mounted. Must run as uid 2000 (Shizuku)
++        // because after insmod KernelSU re-enables SELinux enforcing and
++        // only shell retains root via allow_shell=1.
++        appendLog("[*] Loading KernelSU-Next LKM + module mount stages...")
++        val loaderCmd = "${helper.absolutePath} --ksu-full $ksudDest /data/local/tmp/exploit.log"
++        val loaderOut = handle.service.exec(loaderCmd)
++        if (loaderOut.isNotBlank()) {
++            appendLog(loaderOut.take(2000))
+         }
+ 
+-        // 4. Verify KSU is actually loaded (check multiple paths)
+-        var ksuActive = false
+-        for (i in 1..10) {
+-            val check = runHelper(helper, "-c",
+-                "test -e /dev/kernelsu && echo KSU_OK || " +
+-                "test -e /sys/kernel/kernelsu && echo KSU_OK || " +
+-                "test -e /data/adb/ksu && echo KSU_OK || " +
+-                "echo KSU_NOT_FOUND")
+-            if (check.output.contains("KSU_OK")) {
+-                appendLog("[+] KernelSU verified (attempt $i): ${check.output.take(60)}")
+-                ksuActive = true
+-                break
+-            }
+-            Thread.sleep(500)
+-        }
+-        require(ksuActive) {
+-            app.getString(
+-                R.string.error_ksu_verify,
+-                lateResult.code,
+-                lateResult.output.take(200)
+-            )
++        // 4. Verify the module is live
++        val check = handle.service.exec("grep kernelsu /proc/modules || echo KSU_NOT_FOUND")
++        appendLog("[*] Module check: ${check.take(200)}")
++        require(check.contains("kernelsu") && !check.contains("KSU_NOT_FOUND")) {
++            app.getString(R.string.error_ksu_verify, 1, loaderOut.take(200))
+         }
+         appendLog(app.getString(R.string.log_ksu_control_verified))
+     }
+@@ -452,8 +440,8 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
+         viewModelScope.launch(Dispatchers.IO) {
+             val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+             if (!helper.exists()) return@launch
+-            val result = runHelper(helper, "-c",
+-                "killall -9 system_server 2>/dev/null; true")
++            val result = runHelper(helper, "sh", "-c",
++                "'killall -9 system_server 2>/dev/null; true'")
+             appendLog("[*] Soft reboot triggered (exit ${result.code})")
+         }
+     }
+diff --git a/app/src/main/kotlin/com/alex193a/rootmypixel/feature/main/MainActivity.kt b/app/src/main/kotlin/com/alex193a/rootmypixel/feature/main/MainActivity.kt
+index 89e71c3..f55af3b 100644
+--- a/app/src/main/kotlin/com/alex193a/rootmypixel/feature/main/MainActivity.kt
++++ b/app/src/main/kotlin/com/alex193a/rootmypixel/feature/main/MainActivity.kt
+@@ -88,6 +88,7 @@ class MainActivity : ComponentActivity() {
+                     uptimeExceeded = uptimeExceeded,
+                     onRefresh = { installViewModel.refresh() },
+                     onInstall = { installViewModel.install() },
++                    onMountModules = { installViewModel.mountModules() },
+                     onExportLog = { installViewModel.exportLog() },
+                 )
+             }
+@@ -109,6 +110,7 @@ private fun MainScreen(
+     uptimeExceeded: Boolean,
+     onRefresh: () -> Unit,
+     onInstall: () -> Unit,
++    onMountModules: () -> Unit,
+     onExportLog: () -> Unit,
+ ) {
+     val context = LocalContext.current
+@@ -247,6 +249,20 @@ private fun MainScreen(
+                 )
+             }
+ 
++            // Mount modules button: re-runs ksud post-fs-data/services stages for
++            // the already-live KSU module (e.g. after installing a new zip module).
++            OutlinedButton(
++                onClick = onMountModules,
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .height(48.dp),
++                enabled = state.phase == InstallPhase.Installed,
++            ) {
++                Icon(Icons.Rounded.Shield, contentDescription = null)
++                Spacer(modifier = Modifier.width(8.dp))
++                Text("Mount KSU modules")
++            }
++
+             Spacer(modifier = Modifier.height(12.dp))
+ 
+             // Log preview
+diff --git a/app/src/main/kotlin/com/alex193a/rootmypixel/feature/main/MainViewModel.kt b/app/src/main/kotlin/com/alex193a/rootmypixel/feature/main/MainViewModel.kt
+index e9d894c..6c80b20 100644
+--- a/app/src/main/kotlin/com/alex193a/rootmypixel/feature/main/MainViewModel.kt
++++ b/app/src/main/kotlin/com/alex193a/rootmypixel/feature/main/MainViewModel.kt
+@@ -1,10 +1,13 @@
+ package com.alex193a.rootmypixel.feature.main
+ 
+ import android.app.Application
++import android.content.ComponentName
+ import android.content.Context
+ import android.content.Intent
++import android.content.ServiceConnection
+ import android.content.pm.PackageManager
+ import android.os.Handler
++import android.os.IBinder
+ import android.os.Looper
+ import android.os.Process
+ import android.os.SystemClock
+@@ -18,6 +21,8 @@ import com.alex193a.rootmypixel.domain.model.InstallPhase
+ import com.alex193a.rootmypixel.domain.model.InstallUiState
+ import com.alex193a.rootmypixel.domain.usecase.ResolveTargetUseCase
+ import com.alex193a.rootmypixel.feature.install.InstallActivity
++import com.alex193a.rootmypixel.shizuku.ExploitService
++import com.alex193a.rootmypixel.shizuku.IExploitService
+ import com.alex193a.rootmypixel.utils.NativeProbe
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+@@ -41,6 +46,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
+     private val mutableReSukiSuInstalled = MutableStateFlow(false)
+     private val mutableUptimeExceeded = MutableStateFlow(false)
+     private var refreshJob: Job? = null
++    private var mountJob: Job? = null
+ 
+     val state: StateFlow<InstallUiState> = mutableState.asStateFlow()
+     val shizukuAvailable: StateFlow<Boolean> = mutableShizukuAvailable.asStateFlow()
+@@ -112,7 +118,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
+                 mutableReSukiSuInstalled.value = app.packageManager
+                     .getLaunchIntentForPackage("com.resukisu.resukisu") != null
+                 val probe = NativeProbe.run()
+-                if (NativeProbe.isKernelSuActive()) {
++                if (NativeProbe.isKernelSuActive() || isKernelSuLiveViaShizuku()) {
+                     mutableState.value = InstallUiState(
+                         phase = InstallPhase.Installed,
+                         message = app.getString(R.string.status_ksu_active),
+@@ -177,6 +183,158 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
+         app.startActivity(intent)
+     }
+ 
++    /**
++     * Re-run the KernelSU-Next boot stages (post-fs-data, services,
++     * boot-completed) so modules installed after boot get mounted.
++     * Requires the KSU module to already be live and Shizuku shell access,
++     * because after insmod only uid 2000 retains root (allow_shell=1).
++     */
++    fun mountModules() {
++        if (mountJob?.isActive == true) return
++        if (refreshJob?.isActive == true) refreshJob?.cancel()
++        mountJob = viewModelScope.launch(Dispatchers.IO) {
++            try {
++                require(mutableShizukuAvailable.value) {
++                    "Shizuku shell access required for module mount"
++                }
++                val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
++                require(helper.exists()) {
++                    app.getString(R.string.error_helper_unavailable)
++                }
++
++                mutableState.value = mutableState.value.copy(
++                    phase = InstallPhase.LoadingKernelSu,
++                    message = "Mounting KernelSU modules…",
++                )
++                appendLog("[*] Running KernelSU-Next module mount stages…")
++
++                val handle = bindExploitService()
++                    ?: throw IllegalStateException("Failed to bind Shizuku UserService")
++                try {
++                    val ksudCheck = handle.service.exec(
++                        "ls /data/local/tmp/ksud 2>/dev/null || echo KSUD_MISSING"
++                    )
++                    require(ksudCheck.contains("ksud") && !ksudCheck.contains("KSUD_MISSING")) {
++                        "ksud not found at /data/local/tmp/ksud — run Install first"
++                    }
++
++                    val out = handle.service.exec(
++                        "${helper.absolutePath} --ksu-mount /data/local/tmp/ksud"
++                    )
++                    if (out.isNotBlank()) {
++                        appendLog(out.take(2000))
++                    }
++                    // ksu_mount_main has no SUCCESS marker; it is done when all
++                    // three ksud stages report rc=0.
++                    require(
++                        out.contains("post-fs-data rc=0") &&
++                        out.contains("services rc=0") &&
++                        out.contains("boot-completed rc=0")
++                    ) {
++                        "ksu-mount stages did not complete"
++                    }
++
++                    val mounts = handle.service.exec("mount | grep ' on /system ' | head -2")
++                    appendLog("[*] /system mounts: ${mounts.take(200)}")
++                } finally {
++                    unbindExploitService(handle)
++                }
++
++                appendLog("[+] KSU modules mounted")
++                mutableState.value = mutableState.value.copy(
++                    phase = InstallPhase.Installed,
++                    message = app.getString(R.string.status_ksu_active),
++                )
++            } catch (error: Throwable) {
++                if (error is CancellationException) throw error
++                appendLog("[-] ${error.message ?: error.javaClass.simpleName}")
++                mutableState.value = mutableState.value.copy(
++                    phase = InstallPhase.Failed,
++                    message = "Module mount failed — see log",
++                )
++            }
++        }
++    }
++
++    // LKM mode has no /dev/kernelsu and /data/adb is root-only, so an
++    // untrusted app cannot see the live module directly. Ask Shizuku's
++    // shell instead: it can read /proc/modules.
++    private fun isKernelSuLiveViaShizuku(): Boolean {
++        if (!mutableShizukuAvailable.value) return false
++        val handle = bindExploitService() ?: return false
++        return try {
++            val out = handle.service.exec("grep -q kernelsu /proc/modules && echo KSU_LIVE || echo KSU_ABSENT")
++            out.contains("KSU_LIVE")
++        } catch (_: Exception) {
++            false
++        } finally {
++            unbindExploitService(handle)
++        }
++    }
++
++    // --- Shizuku UserService helpers (same pattern as InstallViewModel) ---
++
++    private data class ShizukuServiceHandle(
++        val service: IExploitService,
++        val conn: ServiceConnection,
++    )
++
++    private fun userServiceArgs(): Shizuku.UserServiceArgs =
++        Shizuku.UserServiceArgs(
++            ComponentName(app.packageName, ExploitService::class.java.name)
++        )
++            .daemon(false)
++            .processNameSuffix("exploit_service")
++            .version(1)
++
++    private fun bindExploitService(): ShizukuServiceHandle? {
++        val args = userServiceArgs()
++
++        var service: IExploitService? = null
++        val conn = object : ServiceConnection {
++            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
++                service = IExploitService.Stub.asInterface(binder)
++                synchronized(this) {
++                    (this as Object).notifyAll()
++                }
++            }
++            override fun onServiceDisconnected(name: ComponentName?) {
++                service = null
++            }
++        }
++
++        Shizuku.bindUserService(args, conn)
++
++        synchronized(conn as Object) {
++            if (service == null) {
++                try {
++                    (conn as Object).wait(5000)
++                } catch (_: InterruptedException) {
++                }
++            }
++        }
++
++        val svc = service ?: run {
++            Shizuku.unbindUserService(args, conn, true)
++            return null
++        }
++        return ShizukuServiceHandle(svc, conn)
++    }
++
++    private fun unbindExploitService(handle: ShizukuServiceHandle) {
++        Shizuku.unbindUserService(userServiceArgs(), handle.conn, true)
++    }
++
++    private fun appendLog(line: String) {
++        val cleanLine = line.trim()
++        if (cleanLine.isBlank()) return
++        mutableState.value = mutableState.value.copy(
++            log = (mutableState.value.log + "\n" + cleanLine)
++                .trim()
++                .takeLast(MAX_LOG_CHARS),
++        )
++    }
++
+     fun softReboot() {
+         viewModelScope.launch(Dispatchers.IO) {
+             val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+@@ -185,8 +343,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
+             try {
+                 val result = runCatching {
+                     val process = ProcessBuilder(
+-                        helper.absolutePath, "-c",
+-                        "killall -9 system_server 2>/dev/null; true"
++                        helper.absolutePath, "sh", "-c",
++                        "'killall -9 system_server 2>/dev/null; true'"
+                     ).redirectErrorStream(true).start()
+                     process.inputStream.bufferedReader().use { it.readText() }
+                     process.waitFor()
+@@ -217,5 +375,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
+     companion object {
+         private const val SHIZUKU_PERMISSION_CODE = 101
+         private const val UPTIME_THRESHOLD_MS = 5 * 60 * 1000L // 5 minutes
++        private const val MAX_LOG_CHARS = 64 * 1024
+     }
+ }
+diff --git a/app/src/main/kotlin/com/alex193a/rootmypixel/shizuku/ExploitService.kt b/app/src/main/kotlin/com/alex193a/rootmypixel/shizuku/ExploitService.kt
+index a80ca5f..21a2a69 100644
+--- a/app/src/main/kotlin/com/alex193a/rootmypixel/shizuku/ExploitService.kt
++++ b/app/src/main/kotlin/com/alex193a/rootmypixel/shizuku/ExploitService.kt
+@@ -46,6 +46,10 @@ class ExploitService : IExploitService.Stub() {
+         ).redirectErrorStream(true)
+         pb.environment()["RMG_CLIENT_UID"] = "2000"
+         pb.environment()["RMG_APP_UID"] = appUid.toString()
++        // Same flag as run_exploit.py: accept the pselect route when the CFI
++        // descriptors report non-ready; without it the payload demands
++        // ret == PSELECT_EXPECTED_READY and every attempt is a quality miss.
++        pb.environment()["PSELECT_ACCEPT_NONREADY_CFI"] = "1"
+ 
+         val p = pb.start()
+         synchronized(this) {

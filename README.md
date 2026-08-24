@@ -1,0 +1,402 @@
+# Root-My-Pixel-Pixel6a
+
+**Локальный root для Google Pixel 6a (bluejay) через уязвимость ядра CVE-2026-43499 (IonStack).**
+
+Репозиторий содержит два рабочих пути:
+
+- классический запуск payload с компьютера через `adb`;
+- полностью безкомандный запуск с телефона через форк Root My Pixel и Shizuku.
+
+Ни один путь не разблокирует bootloader и не прошивает разделы. Root, LKM и установленные в память модули живут до следующей перезагрузки телефона.
+
+Проверено на `Pixel 6a / bluejay`, build `CP1A.260405.005`, fingerprint release `15001963`, Android 16, kernel `6.1.145-android14-11`. Локальный payload проходил 3/3 холодных прогонов в adb-конвейере; финальный безкомандный путь также проверен от перезагрузки до работающего KernelSU-Next и модуля OverlayFS.
+
+---
+
+## ⚠️ Важные предупреждения
+
+1. **Это эксплойт ядра.** Неудачный прогон может вызвать kernel panic, перезагрузку или возврат в Recovery. Сделайте резервную копию важных данных. Не выбирайте в Recovery `Wipe data/factory reset` без отдельного решения о потере данных.
+2. Root действует **до перезагрузки телефона**. После перезагрузки всё возвращается в исходное состояние (никаких следов в системе не остаётся).
+3. Работает **только на Pixel 6a** со сборкой **CP1A.260405.005** (Android 16, kernel branch `android14`, ядро 6.1.145). На других прошивках/устройствах запускать бессмысленно.
+4. Используйте на свой страх и риск. Автор не несёт ответственности за любой ущерб.
+
+---
+
+## Что вам понадобится
+
+| Что | Зачем |
+|---|---|
+| Pixel 6a со сборкой `CP1A.260405.005` | цель эксплуатации |
+| Компьютер (macOS или Linux) | нужен только для adb-пути или сборки |
+| `adb` (Android platform-tools) | нужен только для adb-пути |
+| Python 3 | запуск adb-скрипта |
+| Shizuku + Wireless debugging | безкомандный запуск с телефона |
+| (только для сборки из исходников) Android NDK r25+ | компиляция |
+
+Проверить сборку телефона:
+
+```bash
+adb shell getprop ro.build.display.id   # должно быть CP1A.260405.005
+adb shell cat /proc/version            # должно быть 6.1.145-android14-11-...
+```
+
+---
+
+## 🔓 Financed-device carrier/SIM lock (`CARD_RESTRICTED`)
+
+Для проверенного Pixel 6a с Google/Verizon financed-device lock добавлен отдельный
+workflow, который переживает ребут и появление Wi-Fi. В диагностированном случае
+правила модема постоянно пере-устанавливал защищённый системный пакет
+`com.google.android.apps.work.oobconfig`; простое очищение
+`CarrierRestrictionRules`, wipe DeviceLock или отключение сети давали только
+временный результат.
+
+Короткий путь после получения KernelSU root:
+
+```bash
+# на компьютере: либо скачать готовый carrier-unlock.jar из GitHub Release,
+# либо собрать helper самостоятельно (нужны JDK + Android SDK API/build-tools 36)
+./tools/carrier-unlock/build.sh
+
+# проверить точную модель/build/root, создать бэкапы, очистить modem rules,
+# убрать OobConfig только для Android user 0 и сразу перезагрузить телефон
+python3 tools/carrier-unlock/apply_oobconfig_fix.py --apply
+```
+
+После загрузки проверка должна показать: пакет отсутствует для user 0, процесса
+`OobConfig` нет, новых `SET_ALLOWED_CARRIERS` нет, SIM — `LOADED`. Обязательно
+проверять с включённым Wi-Fi: без интернета неполный wipe выглядит успешным, но
+пакет позже скачивает provisioning config и снова блокирует SIM.
+
+Полная процедура, критерии применимости, диагностика, откат и ограничения:
+**[`docs/carrier-lock.md`](docs/carrier-lock.md)**.
+
+Это не отменяет financing/договор и не снимает OEM/bootloader carrier lock.
+Используйте только на принадлежащем вам устройстве; не публикуйте IMEI, serial,
+IMSI/ICCID, `oobconfig_prefs.xml`, FCM-токены или полные логи.
+
+---
+
+## Быстрый старт (готовые бинарники)
+
+В папке `binaries/` уже лежат собранные файлы — компилировать ничего не нужно.
+
+1. Включите на телефоне **Настройки → О телефоне → Номер сборки** (7 нажатий) → вернитесь → **Для разработчиков → Отладка по USB**.
+2. Подключите телефон по USB и подтвердите отладку (если спросит — отметьте «Всегда»).
+3. Проверьте связь: `adb devices` → телефон должен быть в списке как `device`.
+4. Запустите:
+
+```bash
+python3 run_exploit.py
+```
+
+5. Скрипт зальёт бинарники, запустит эксплойт и будет показывать прогресс. Успех выглядит примерно так:
+
+```
+[+] pipe physrw pid=... done=1 root=1 kaslr=1 read_ok=1 write_ok=1 rw64=1/1 uid=2000->0 ...
+[+] embedded su daemon ready pid=... socket=/data/local/tmp/temp_su.sock
+[+] root child result done=1 uid_after=0 ... selinux=1->0
+```
+
+6. Телефон **не перезагружается** — root получен, su-демон работает.
+
+---
+
+## Как пользоваться root
+
+После успешного прогона — прямо из adb:
+
+```bash
+# получить root-шелл
+adb shell /data/local/tmp/su
+
+# выполнить команду от root
+adb shell /data/local/tmp/su id
+# uid=0(root) ... context=u:r:kernel:s0
+
+# или цепочку команд
+adb shell /data/local/tmp/su 'echo ROOT_OK; whoami'
+```
+
+Особенности:
+
+- SELinux после эксплуатации переводится в `Permissive` (иначе никакой демон не смог бы работать). Это нормально и ожидаемо.
+- Демон живёт в контексте `u:r:kernel:s0` и переживает завершение эксплойта.
+- `su` также ставится в `/apex/com.android.virt/bin/su` — его видит `adb root`-подобный механизм проверки.
+- После перезагрузки телефона root пропадёт. Чтобы получить снова — запустите `run_exploit.py` ещё раз.
+
+---
+
+## Сборка из исходников
+
+Нужен Android NDK r25+ (проверено с NDK 27.2.12479018).
+
+```bash
+export ANDROID_NDK_HOME=/путь/к/ndk
+cd payload-src
+make TARGET=bluejay-CP1A.260405.005
+```
+
+Результат:
+
+- `build/bluejay-CP1A.260405.005/cve-2026-43499-app.so` — пейлоад
+- `build/bluejay-CP1A.260405.005/cve-2026-43499-root` — хелпер/су-демон
+
+Скопируйте их в `binaries/` (перезаписав готовые) и запускайте `run_exploit.py`.
+
+---
+
+## Что может пойти не так
+
+| Симптом | Что происходит | Что делать |
+|---|---|---|
+| Телефон перезагрузился | Эксплойт упал в ядре (slab-реклайм не попал в цель) | Просто запустить скрипт ещё раз |
+| `slide-kaslr-ok` нет, скрипт крутится | Раскладка памяти неблагоприятная | Запустить ещё раз; иногда помогает подождать 1–2 минуты после загрузки |
+| Скрипт пишет `device not present` | adb не видит телефон | Проверьте кабель/отладку, `adb devices` |
+| После успеха `su` не работает | Демон убит (редко) | Перезапустить прогон |
+
+Стабильность: двухфазный slab-реклайм (см. ниже) делает прогон устойчивым к состоянию памяти сразу после загрузки; на практике 3/3 холодных запуска подряд завершились успешно с первой или второй попытки слайд-стадии.
+
+---
+
+## Как это работает (простыми словами)
+
+1. **Уязвимость (CVE-2026-43499, «IonStack»)** — в ядре есть ошибка использования-после-освобождения (use-after-free) в механизме futex/rt-mutex: объект, на который ещё можно ссылаться, уже удалён из памяти.
+
+2. **Шаг 1 — обход KASLR (slide).** Ядро загружается со случайным сдвигом адресов. Эксплойт через трюк с `pselect` (копирование стека) и поддельную структуру rt-mutex аккуратно «прогуливается» по цепочке объектов и записывает известное значение (boot_id) в известное место. По факту записи вычисляется реальный адрес ядра — «слайд» найден.
+
+3. **Шаг 2 — подготовка цели.** Эксплойт создаёт кучу процессов-«детей», у каждого свой `mm_struct` (описание памяти процесса) в slab-кэше ядра. Один из них становится «жертвой»: его `mm_struct` мы находим, а затем освобождаем его slab, пока данные ещё используются.
+
+4. **Шаг 3 — реклайм (двухфазный).** Освобождённый slab нужно снова занять своим содержимым — поддельным объектом rt-mutex, в котором мы управляем всеми указателями. Для этого эксплойт массово шлёт сетевые буферы (skb-frags), которые ядро аллоцирует страницами того же размера:
+   - **Фаза 1:** тысячи фрагментов заранее «съедают» все блоки памяти, которые allocator отдал бы нашим запросам по пути (fallback-блоки RECLAIMABLE), и заодно переводят страницы в нужный тип (UNMOVABLE).
+   - **Фаза 2:** освобождаем slab жертвы и тут же занимаем его своими фрагментами — теперь в «свободном» slab лежит наш поддельный объект.
+5. **Шаг 4 — привилегии.** Через поддельный rt-mutex и цепочку PI (priority inheritance) эксплойт перезаписывает таблицу операций файла (fops) в `ashmem` — получает произвольное чтение/запись памяти ядра (pipe-physrw).
+6. **Шаг 5 — root.** Через произвольную запись меняются `cred` текущего процесса: uid → 0, SELinux → Permissive. Затем ставится `su`-демон (сам хелпер копируется в `/apex/com.android.virt/bin/su` и `/data/local/tmp/su`), который принимает команды по локальному сокету — это и есть ваш постоянный root до перезагрузки.
+
+---
+
+## KernelSU Next (LKM) поверх root
+
+Поверх полученного root можно загрузить **KernelSU-Next v3.3.0** как LKM-модуль. Проверенный менеджер показывает `Работает`, `LKM (GKI2)`, `Режим Jailbreak`, а root выдаётся в домене `u:r:ksu:s0` уже при SELinux Enforcing. Для монтирования zip-модулей используется `meta-overlayfs` v1.3.1.
+
+### Почему нужен патч модуля
+
+Готовые `.ko` из релизов KernelSU-Next рассчитаны на GKI-ядра, где нужные символы (`selinux_state`, `policydb_*` и т.д.) экспортированы. Ядро Pixel 6a (GS101, `6.1.145-android14-11`) эти символы **содержит, но не экспортирует** — поэтому обычный `insmod` релизного модуля падает с `Unknown symbol`.
+
+Решение: перед загрузкой пропатчить ELF модуля — все неопределённые импорты (`SHN_UNDEF`) превращаются в абсолютные символы (`SHN_ABS`) с реальными адресами ядра = `адрес_из_kallsyms + KASLR_slide`. Ядру тогда вообще не нужно искать экспорты.
+
+### Один прогон — всё сразу
+
+```bash
+pip3 install pyelftools
+./ksun/ksun_pipeline.sh        # reboot -> эксплойт -> патч -> insmod -> проверка
+```
+
+Скрипт сам: перезагружает телефон, запускает эксплойт, берёт KASLR slide из лога пейлоада (`slide=...`), патчит `ksun/android14-6.1_kernelsu_v3.3.0.ko` и загружает его с `allow_shell=1`.
+
+Результат:
+
+```
+kernelsu 319488 0 - Live        # модуль в ядре
+Работает / LKM (GKI2)           # менеджер KernelSU Next
+$ ksud debug su                 # root-шелл
+uid=0(root) ... context=u:r:ksu:s0
+```
+
+### Файлы
+
+- `ksun/ksun_pipeline.sh` — полный конвейер (см. выше)
+- `ksun/patch_ko.py` — патчер ELF: `UND → ABS` по таблице символов
+- `ksun/bluejay-CP1A.260405.005.ksym.tsv` — link-адреса всех 102 086 символов ядра (извлечены из `boot.img` сборки `15001963` через `vmlinux-to-elf`)
+- `ksun/android14-6.1_kernelsu_v3.3.0.ko` — оригинальный релизный модуль KernelSU-Next
+
+Требуется установленный менеджер [KernelSU-Next v3.3.0](https://github.com/KernelSU-Next/KernelSU-Next/releases) (com.rifsxd.ksunext) и `ksud` из того же релиза, запушенный в `/data/local/tmp/ksud`.
+
+### Как получена таблица символов
+
+```bash
+# boot.img снят с самого устройства (слот b):
+adb shell 'su dd if=/dev/block/by-name/boot_b of=/data/local/tmp/boot_b.img'
+adb pull /data/local/tmp/boot_b.img
+# из него — kernel Image (boot header v4), затем:
+pip3 install vmlinux-to-elf pyelftools
+vmlinux-to-elf kernel.img kernel.elf     # найдёт kallsyms: base ffffffc008000000
+python3 - <<'PY'                          # выгрузка .symtab в ksym.tsv
+from elftools.elf.elffile import ELFFile
+e = ELFFile(open('kernel.elf','rb')); s = e.get_section_by_name('.symtab')
+out = open('bluejay-CP1A.260405.005.ksym.tsv','w')
+for sym in s.iter_symbols():
+    if sym.name and sym['st_value']:
+        out.write(f"{sym['st_value']:016x}\t{sym.name}\n")
+PY
+```
+
+### Ограничения
+
+- Slide меняется при каждой загрузке — патч делается заново (pipeline это делает автоматически).
+- KSUN в late-load сам возвращает SELinux в Enforcing — это штатное поведение; temp-su демон из эксплойта после этого недоступен (используйте `ksud debug su`).
+- Всё по-прежнему живёт до перезагрузки: после ребута повторите `ksun_pipeline.sh`.
+
+### Совместимость с ReSukiSU
+
+Upstream Root My Pixel использует название **ReSukiSU** и показывает его как активный generic KSU-интерфейс. В проверенном пути этого репозитория фактически загружается **KernelSU-Next v3.3.0 LKM**, а используется менеджер `com.rifsxd.ksunext` той же версии. Отдельный ReSukiSU Manager v4.2.0-rc1 был проверен, но для загруженного KernelSU-Next LKM показывал `Not installed`; поэтому его кнопка установки ядра не является частью этого workflow.
+
+Не нажимайте верхнюю кнопку `Установить` на главном экране KSUN/ReSukiSU Manager: это boot-patch workflow, который требует разблокированный bootloader и не нужен для LKM. В нашем сценарии загружается уже пропатченный LKM в память, без изменения boot-раздела.
+
+---
+
+## Zip-модули KernelSU — без команд и без перезагрузки
+
+В безкомандном workflow команды вводить не требуется:
+
+1. zip устанавливается в **KernelSU-Next Manager**: вкладка `Модуль` → верхняя иконка `Установить` → выбрать zip в системном файловом окне → `ОК`;
+2. в форке Root My Pixel нажимается **Mount KSU modules**;
+3. приложение повторяет `post-fs-data`, `services` и `boot-completed`, после чего OverlayFS появляется в namespace init и виден новым приложениям.
+
+Этот путь проверен на `overlaytest.zip`: менеджер показал `Module installed successfully!`, кнопка Mount создала `KSU on /system type overlay`, а `/system/bin/overlaytest` стал виден и исполним. Команды ниже оставлены только для adb/debug и разработки.
+
+### Шаг 0: метамодуль (обязателен)
+
+В KSUN v3.3.0 монтирование вынесено в отдельный «метамодуль». Без него модули ставятся, но **не монтируются**. Официальный — [meta-overlayfs](https://github.com/KernelSU-Modules-Repo/meta-overlayfs) (v1.3.1):
+
+Для полностью безкомандной первичной настройки скачайте zip метамодуля на самом
+телефоне из официального release, откройте KSUN Manager → `Модуль` → `Установить`,
+выберите zip и подтвердите установку. Затем в Root My Pixel нажмите **Mount KSU
+modules** один раз. После этого обычные zip-модули устанавливаются тем же UI-путём.
+Компьютер и adb для этой настройки не нужны.
+
+```bash
+# Legacy/debug-вариант той же первичной настройки:
+adb push meta-overlayfs-13100-1.3.1.zip /data/local/tmp/
+adb shell "echo '/data/local/tmp/ksud module install /data/local/tmp/meta-overlayfs-13100-1.3.1.zip' \
+    | /data/local/tmp/ksud debug su"
+# активация метамодуля (один раз после его установки):
+adb shell "echo '/data/local/tmp/ksud post-fs-data' | /data/local/tmp/ksud debug su"
+```
+
+### Шаг 1: установка и монтирование модуля через UI (рекомендуется)
+
+После установки `meta-overlayfs` один раз стабилизируйте его состояние кнопкой **Mount KSU modules**. Затем для каждого модуля:
+
+1. откройте KSUN Manager → `Модуль` → верхняя иконка `Установить`;
+2. выберите zip в `Скачанные` или во внутреннем хранилище и подтвердите `ОК`;
+3. вернитесь в Root My Pixel и нажмите **Mount KSU modules**.
+
+Не путайте верхнюю кнопку `Установить` на главном экране менеджера с кнопкой на вкладке `Модуль`: первая относится к boot-patch, вторая устанавливает обычный zip-модуль.
+
+### Legacy/debug: установка и монтирование командами
+
+```bash
+adb push mymodule.zip /data/local/tmp/
+adb shell "echo '/data/local/tmp/ksud module install /data/local/tmp/mymodule.zip' \
+    | /data/local/tmp/ksud debug su"       # metainstall.sh метамодуля сложит контент в ext4-образ
+adb shell "echo '/data/local/tmp/ksud post-fs-data' \
+    | /data/local/tmp/ksud debug su"       # вот он — «ребут для модулей»: OverlayFS поверх /system
+adb shell "echo '/data/local/tmp/ksud services' | /data/local/tmp/ksud debug su"          # опционально
+adb shell "echo '/data/local/tmp/ksud boot-completed' | /data/local/tmp/ksud debug su"    # опционально
+```
+
+Проверка (из нового процесса — новый shell, новое приложение):
+
+```bash
+adb shell mount | grep KSU
+# KSU on /system type overlay (ro,seclabel,relatime,lowerdir=.../mnt/<id>/system:/system)
+```
+
+### Как это работает
+
+- `ksud module install` без метамодуля кладёт zip в `/data/adb/modules/`; с метамодулем контент дополнительно копируется в его ext4-образ (`/data/adb/modules/meta-overlayfs/mnt/`).
+- `ksud post-fs-data` — та самая стадия, которая на обычных устройствах выполняется при загрузке до старта zygote: обрабатывает обновления модулей и запускает `metamount.sh` → OverlayFS поверх `/system`, `/vendor` и т.д.
+- Монтирование происходит в namespace init и **видно zygote** — все новые приложения получают файлы модуля. Уже запущенные приложения увидят изменения после своего перезапуска.
+- `ksud soft-reboot` (осторожно, убивает все приложения) перезапускает только zygote/framework: `stop` → стадии → `start`, ядро и LKM не трогаются — штатный способ «перезагрузки» без потери root.
+
+### Нюансы
+
+- Первая установка модуля сразу после установки метамодуля блокируется («Metamodule installation blocked») — метамодуль находится в состоянии update; один `post-fs-data` стабилизирует состояние.
+- Живые mount'ы не откатываются при uninstall модуля до перезагрузки — файлы могут оставаться видимыми; после ребута всё чисто.
+- Скрипты модуля — `post-fs-data.sh`, `service.sh`, `boot-completed.sh` в **корне** модуля (не в `*.d/`-подкаталогах: те относятся только к общим `/data/adb/*.d`).
+
+---
+
+## Без ПК: root + KernelSU-Next одним нажатием (форк Root My Pixel)
+
+Всё то же самое — эксплойт, ELF-патч LKM под текущий KASLR-слайд, `insmod`, бут-стадии KSU и монтирование модулей — умеет делать **модифицированное приложение Root My Pixel**, без компьютера, adb-команд и ручного ввода shell-команд. Единственное требование — работающий Shizuku (запускается на самом устройстве через `Wireless debugging`, root не нужен).
+
+Готовый APK: см. [Releases](https://github.com/DurkaEbanaya/Root-My-Pixel-Pixel6a/releases) (`root-my-pixel-pixel6a-debug.apk`). Исходники — форк [alex193a/Root-My-Pixel](https://github.com/alex193a/Root-My-Pixel); diff приложения лежит в `app-fork-root-my-pixel.patch` (применяется поверх апстрима, свои бинарники кладутся в `app/src/main/assets/exploits/`, `assets/ksud/` и `jniLibs/arm64-v8a/libcve43499root.so`).
+
+### Что добавлено в приложение
+
+- **Кнопка Install** гоняет полный конвейер через Shizuku (uid 2000): наш пейлоад → su-демон → staging `ksud` → `libcve43499root.so --ksu-full` (патч .ko по слайду из лога эксплойта, `insmod`, `post-fs-data`/`services`/`boot-completed`, перезапуск менеджера KSUN).
+- **Кнопка Mount KSU modules** повторяет бут-стадии для уже живого LKM — это «ребут для модулей» без перезагрузки: установил zip-модуль через менеджер/`ksud`, нажал Mount — получил OverlayFS поверх `/system`.
+- Zip-модули устанавливаются непосредственно в UI KSUN Manager; `ksud module install` нужен только для legacy/debug-пути.
+- Детект живого LKM через Shizuku (`grep kernelsu /proc/modules`): в LKM-режиме нет `/dev/kernelsu`, а `/data/adb` закрыт для untrusted-приложения.
+- Эксплойту передаётся `PSELECT_ACCEPT_NONREADY_CFI=1` — тот же флаг, что и в `run_exploit.py`; без него маршрут pselect бракуется по «quality miss» и root не получается.
+
+### Внутренняя последовательность
+
+1. Shizuku запускает `ExploitService` с shell UID 2000.
+2. `ExploitService` передаёт payload и helper во временное хранилище и запускает `--run-payload`, передавая `RMG_CLIENT_UID=2000`, UID приложения и `PSELECT_ACCEPT_NONREADY_CFI=1`.
+3. Payload получает temporary root, записывает `slide=...` в exploit log и оставляет su-демон на Unix-сокете.
+4. Helper копирует `ksud` во временный путь, патчит встроенный `.ko`: 209 импортов `SHN_UNDEF` превращаются в `SHN_ABS` по таблице link-адресов ядра плюс текущий KASLR slide.
+5. `--ksu-full` загружает LKM с `allow_shell=1`, выполняет три ksud-стадии и перезапускает KSUN Manager. После insmod SELinux штатно возвращается в Enforcing.
+6. `--ksu-mount` LKM не загружает: он только повторяет три ksud-стадии для уже живого модуля. Поэтому установка zip и его активация разделены на две UI-кнопки.
+
+### Что было проверено на устройстве
+
+- официальный Root My Pixel v1.2 распознал `bluejay / CP1A.260405.005`, но его ReSukiSU Manager не признал загруженный KSUN LKM установленным;
+- форк с локальным helper успешно прошёл полный путь после холодной загрузки: `done=1 root=1`, staging `ksud`, `kernelsu Live`, KSUN Manager `Работает / LKM (GKI2) / Jailbreak`;
+- установка `overlaytest.zip` через UI KSUN Manager завершилась `Module installed successfully!`;
+- после **Mount KSU modules** файл `/system/bin/overlaytest` стал видимым и исполнимым, а mount выглядел как `KSU on /system type overlay`;
+- менеджер KernelSU-Next v3.3.0 и `meta-overlayfs` v1.3.1 работают вместе в этом LKM-пути.
+
+### Диагностика
+
+- Официальный Root My Pixel v1.2 был отдельно проверен на этом build. Его bluejay payload входил в slide-стадию, но мог завершать прогон kernel panic в `rt_mutex_adjust_prio_chain`; для практического запуска используйте payload и APK из этого репозитория, где применён двухфазный slab reclaim.
+- `Installation failed` с логом payload `done=0 root=0` означает не kernel panic, а неудачный allocator/FOPS-маршрут. После перезагрузки можно повторить Install.
+- Повторяющийся `pselect route quality miss ... ret=0 expected=9` при запуске из приложения означает, что в сборку приложения не передан `PSELECT_ACCEPT_NONREADY_CFI=1`. Используйте APK из Release или примените актуальный app patch.
+- `sh: sh: - : unknown option` на этапе staging означает неправильный вызов su-клиента. Команда должна передаваться как один аргумент в форме `helper sh -c '<command>'`; актуальный patch уже содержит это исправление.
+- `Module mount failed` при стадиях `post-fs-data rc=0`, `services rc=0`, `boot-completed rc=0` обычно означает только неверную проверку маркера старой версии helper: `--ksu-mount` не печатает `SUCCESS`, его результатом являются три `rc=0`.
+- отсутствие `/dev/kernelsu` не доказывает, что LKM не загружен. Для этого пути проверяйте статус через KSUN Manager или `grep kernelsu /proc/modules` из shell/Shizuku.
+- после установки или удаления zip живой mount может сохраняться до reboot из-за namespace. Это не означает, что старый файл снова записан в системный раздел.
+
+### Порядок действий (полностью на устройстве)
+
+1. Перезагрузите Pixel (эксплойту нужен свежий uptime, ориентир — до 5 минут).
+2. Запустите Shizuku через «Беспроводную отладку»: Настройки → Для разработчиков → Беспроводная отладка → `Pair device with pairing code`, затем в Shizuku `Start via Wireless debugging` и введите код. После каждой перезагрузки Shizuku нужно запустить снова.
+3. Откройте Root My Pixel (форк), разрешите доступ к Shizuku («Разрешить всегда»).
+4. Нажмите **Install** — подождите 3–5 минут, не сворачивая приложение (reclaim-фаза прожорлива, фоновый процесс может быть убит).
+5. По завершении менеджер KernelSU-Next сам откроется с статусом «Работает» (LKM GKI2, Jailbreak).
+6. Zip-модули: в KSUN Manager откройте `Модуль` → `Установить`, выберите zip и подтвердите установку. Затем в Root My Pixel нажмите **Mount KSU modules** — изменения появятся в `/system` без перезагрузки.
+
+После каждой перезагрузки устройства root и LKM сбрасываются (bootloader залочен, ничего не прошивается) — повторите шаги 1–4.
+
+### Важные ограничения безкомандного режима
+
+- Не сворачивайте Root My Pixel во время Install: reclaim-фаза занимает несколько минут и чувствительна к memory pressure.
+- `Mount KSU modules` не устанавливает zip сам по себе. Сначала установите zip во вкладке `Модуль` менеджера, затем нажмите Mount.
+- После uninstall живой OverlayFS mount может оставаться видимым до перезагрузки; это штатное ограничение namespace. Для чистого состояния перезагрузите телефон и повторите Install.
+- Кнопка Mount доступна только когда приложение видит `kernelsu` в `/proc/modules` через Shizuku.
+
+---
+
+## Структура репозитория
+
+```
+├── run_exploit.py              # скрипт запуска (заливает бинарники, запускает, показывает прогресс)
+├── binaries/
+│   ├── cve-2026-43499-app.so   # готовый пейлоад (сборка bluejay-CP1A.260405.005)
+│   └── cve-2026-43499-root     # готовый хелпер: запуск пейлоада + su-демон + --ksu-full/--ksu-mount
+├── payload-src/                # исходники пейлоада (src/61/*, targets/, Makefile, ksu_load.c)
+├── ksun/                       # KernelSU-Next LKM: патчер, pipeline, символы ядра, .ko
+├── docs/carrier-lock.md        # диагностика и снятие financed-device carrier/SIM lock
+├── tools/carrier-unlock/       # исходник app_process helper + ABX package-state fix
+└── app-fork-root-my-pixel.patch # diff приложения Root My Pixel (без-ПК режим)
+```
+
+---
+
+## Благодарности
+
+- Уязвимость и техника эксплуатации: **NebuSec IonStack** (CVE-2026-43499)
+- Основа проекта: [Root-My-Pixel](https://github.com/alex193a/Root-My-Pixel)
+- Адаптация и доведение до стабильного cold-boot root для Pixel 6a: этот репозиторий
