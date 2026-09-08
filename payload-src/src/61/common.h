@@ -400,6 +400,8 @@ extern int pipe_cache_slot_hit;
 extern uint64_t pipe_page_slab_cache[PIPE_CANDIDATE_PAGES];
 extern uint32_t pipe_page_type[PIPE_CANDIDATE_PAGES];
 extern uintptr_t pipebuf_page_base;
+extern int g_physrw_fd;
+void physrw_server_launch(int fd, uint64_t fops_slot, uint64_t fops_orig);
 extern uintptr_t pipebuf_addr;
 extern int pipebuf_pipe_idx;
 extern char physrw_readback[64];

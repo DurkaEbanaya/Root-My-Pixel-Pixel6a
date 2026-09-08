@@ -40,6 +40,7 @@ APP_PRELOAD_SRCS := \
   $(SLIDE_SRC) \
   src/61/fops.c \
   src/61/pipe.c \
+  src/61/physrw_server.c \
   src/61/root.c \
   src/61/preload.c
 COMMON_INC := -Isrc/61 -Isrc
