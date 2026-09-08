@@ -11,7 +11,7 @@
 #            ksun/bluejay-CP1A.260405.005.ksym.tsv
 set -o pipefail
 ADB=${ADB:-/usr/local/share/android-commandlinetools/platform-tools/adb}
-S=${SERIAL:-22141JEXXXXXXXX}
+S=${SERIAL:?[!] set SERIAL=<device-serial> env var (do not hardcode)}
 BASE=$(cd "$(dirname "$0")/.." && pwd)
 PY=${PY:-python3}
 "$PY" -c 'import elftools' 2>/dev/null || { print -u2 "pyelftools missing: pip3 install pyelftools"; exit 9; }
