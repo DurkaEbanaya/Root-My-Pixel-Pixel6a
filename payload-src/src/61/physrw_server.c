@@ -169,25 +169,45 @@ static void handle_client(int cfd) {
 
 static void server_loop(void) {
   int log_fd = open(PWRS_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
-  if (log_fd >= 0 && log_fd != g_physrw_fd) {
-    dup2(log_fd, 1);
-    dup2(log_fd, 2);
-    if (log_fd > 2) close(log_fd);
+  if (log_fd >= 0) {
+    dprintf(log_fd, "server enter uid=%d fd=%d logfd=%d errno=%d\n",
+            (int)getuid(), g_physrw_fd, log_fd, errno);
+    if (log_fd != g_physrw_fd) {
+      dup2(log_fd, 1);
+      dup2(log_fd, 2);
+      if (log_fd > 2) close(log_fd);
+    }
   }
 
   unlink(PWRS_SOCK_PATH);
   int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (log_fd >= 0) dprintf(log_fd, "socket=%d errno=%d\n", sfd, errno);
   if (sfd < 0) _exit(3);
 
   struct sockaddr_un sa;
   memset(&sa, 0, sizeof(sa));
   sa.sun_family = AF_UNIX;
   strncpy(sa.sun_path, PWRS_SOCK_PATH, sizeof(sa.sun_path) - 1);
-  if (bind(sfd, (struct sockaddr *)&sa, sizeof(sa)) != 0) _exit(3);
+  if (bind(sfd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    if (log_fd >= 0) dprintf(log_fd, "bind fail errno=%d\n", errno);
+    _exit(3);
+  }
   chmod(PWRS_SOCK_PATH, 0666);
-  if (listen(sfd, 4) != 0) _exit(3);
+  if (listen(sfd, 4) != 0) {
+    if (log_fd >= 0) dprintf(log_fd, "listen fail errno=%d\n", errno);
+    _exit(3);
+  }
 
   dprintf(1, "physrw-server ready pid=%d fd=%d\n", getpid(), g_physrw_fd);
+
+  if (access("/data/local/tmp/burst.sh", X_OK) == 0) {
+    if (fork() == 0) {
+      int dn = open("/dev/null", O_RDWR);
+      if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); if (dn > 2) close(dn); }
+      execl("/system/bin/sh", "sh", "/data/local/tmp/burst.sh", (char *)NULL);
+      _exit(127);
+    }
+  }
 
   for (;;) {
     int cfd = accept(sfd, NULL, NULL);
