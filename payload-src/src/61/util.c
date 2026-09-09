@@ -958,11 +958,13 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
   uintptr_t page = target - (uintptr_t)pos;
   /* Tripwire: page==0 would make the kernel copy from NULL (source of the
    * usercopy BUG panics seen in ramoops), and a non-kernel target means
-   * corrupted caller state. Refuse both instead of panicking the kernel. */
+   * corrupted caller state. Refuse both instead of panicking the kernel.
+   * MUST NOT use pr_error here: pr_error calls exit(-1), which would kill
+   * the whole physrw-server process on the first refused client request. */
   if (page == 0 || !is_kernel_ptr(target)) {
-    pr_error("configfs read refused fd=%d tid=%d target=%016zx len=%zu "
-             "page=%016zx\n",
-             fd, (int)syscall(SYS_gettid), target, len, page);
+    pr_warning("configfs read refused fd=%d tid=%d target=%016zx len=%zu "
+               "page=%016zx\n",
+               fd, (int)syscall(SYS_gettid), target, len, page);
     errno = EINVAL;
     return -1;
   }

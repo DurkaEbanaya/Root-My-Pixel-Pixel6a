@@ -878,6 +878,14 @@ int try_cfi_stage(void) {
    * The server serves kernel-virt + phys memory from THIS process and
    * never returns; the ashmem fops restore below is therefore skipped. */
   if (physrw_read64_ok != 0 && physrw_write64_ok != 0) {
+    /* payload_runner_main armed PDEATHSIG=SIGKILL: if the launcher process
+     * exits (adb session teardown, script timeout), the freshly launched
+     * server dies silently — KILL is uncatchable, physrw.log never sees it.
+     * From here on the server must outlive its parent. */
+    if (prctl(PR_SET_PDEATHSIG, 0) == 0) {
+      pr_info("pdeathsig cleared for server survival ppid=%d\n",
+              (int)getppid());
+    }
     pr_success("physrw-server launching at seam fd=%d\n", fd);
     physrw_server_launch(fd, misc_fops, canon_addr(ASHMEM_FOPS));
   }

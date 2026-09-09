@@ -106,6 +106,31 @@ static void send_response(int fd, uint32_t status, const void *data,
   if (len && data) write_full(fd, data, len);
 }
 
+static void log_client_identity(int peer_pid) {
+  char path[64];
+  char cmdline[256];
+  int fd;
+  ssize_t n;
+
+  snprintf(path, sizeof(path), "/proc/%d/cmdline", peer_pid);
+  fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    pr_info("client pid=%d cmdline unavailable errno=%d\n", peer_pid, errno);
+    return;
+  }
+  n = read(fd, cmdline, sizeof(cmdline) - 1);
+  close(fd);
+  if (n <= 0) {
+    pr_info("client pid=%d cmdline empty\n", peer_pid);
+    return;
+  }
+  cmdline[n] = 0;
+  for (ssize_t i = 0; i < n; i++) {
+    if (cmdline[i] == 0) cmdline[i] = ' ';
+  }
+  pr_info("client pid=%d cmdline=%s\n", peer_pid, cmdline);
+}
+
 static void handle_client(int cfd) {
   struct ucred peer;
   socklen_t peer_len = sizeof(peer);
@@ -115,6 +140,7 @@ static void handle_client(int cfd) {
     peer_uid = peer.uid;
     pr_info("client connect pid=%d uid=%d gid=%d\n",
             peer.pid, peer.uid, peer.gid);
+    log_client_identity(peer.pid);
   }
   for (;;) {
     uint32_t req[8];
@@ -133,6 +159,15 @@ static void handle_client(int cfd) {
     if (len > PWRS_MAX_LEN) {
       send_response(cfd, 2, NULL, 0);
       return;
+    }
+    /* Pre-refuse non-kernel virtual addresses without touching the read
+     * primitive: keeps hostile/stale clients from spamming the tripwire. */
+    if ((cmd == PWRS_VREAD64 || cmd == PWRS_VREAD) &&
+        !is_kernel_ptr((uintptr_t)addr)) {
+      pr_warning("client pid=%d non-kernel vaddr refused %016llx\n",
+                 peer_pid, (unsigned long long)addr);
+      send_response(cfd, 2, NULL, 0);
+      continue;
     }
 
     uint8_t buf[PWRS_MAX_LEN];
@@ -191,6 +226,7 @@ static void handle_client(int cfd) {
 
     send_response(cfd, ok ? 0 : 3, buf, rlen);
   }
+  pr_info("client pid=%d disconnected\n", peer_pid);
 }
 
 static void server_loop(void) {
@@ -204,6 +240,9 @@ static void server_loop(void) {
       if (log_fd > 2) close(log_fd);
     }
   }
+  /* unbuffered stdout so every request/disconnect survives a silent death */
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
 
   int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (log_fd >= 0) dprintf(log_fd, "socket=%d errno=%d\n", sfd, errno);
