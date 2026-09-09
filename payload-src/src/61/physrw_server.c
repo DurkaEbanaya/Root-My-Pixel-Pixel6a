@@ -36,6 +36,8 @@ extern int g_physrw_fd;
 static uint64_t g_fops_slot_addr;   /* &ashmem_fops (kernel global) */
 static uint64_t g_fops_original;    /* original ashmem_fops value */
 
+#define PWRS_LOG_PATH "/data/local/tmp/physrw.log"
+
 static void log_signal_only(int sig) {
   int log_fd = open(PWRS_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
   if (log_fd >= 0) {
@@ -47,8 +49,7 @@ static void log_signal_only(int sig) {
 static void restore_on_signal(int sig) {
   int log_fd = open(PWRS_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
   if (log_fd >= 0) {
-    dprintf(log_fd, "server got signal %d — restoring fops, exiting\n", sig);
-    close(log_fd);
+    dprintf(log_fd, "server got signal %d — restoring fops, exiting\n", sig);    close(log_fd);
   }
   if (g_fops_slot_addr && g_fops_original) {
     kernel_write_data(g_physrw_fd, (uintptr_t)g_fops_slot_addr,
@@ -59,7 +60,6 @@ static void restore_on_signal(int sig) {
 
 #define PWRS_MAGIC 0x50525753u
 #define PWRS_SOCK_PATH "/data/local/tmp/.physrw.sock"
-#define PWRS_LOG_PATH "/data/local/tmp/physrw.log"
 #define PWRS_MAX_LEN 4096
 
 enum {
@@ -107,15 +107,29 @@ static void send_response(int fd, uint32_t status, const void *data,
 }
 
 static void handle_client(int cfd) {
+  struct ucred peer;
+  socklen_t peer_len = sizeof(peer);
+  int peer_pid = -1, peer_uid = -1;
+  if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len) == 0) {
+    peer_pid = peer.pid;
+    peer_uid = peer.uid;
+    pr_info("client connect pid=%d uid=%d gid=%d\n",
+            peer.pid, peer.uid, peer.gid);
+  }
   for (;;) {
     uint32_t req[8];
     if (!read_full(cfd, req, sizeof(req))) return;
-    if (req[0] != PWRS_MAGIC) return;
+    if (req[0] != PWRS_MAGIC) {
+      pr_warning("client pid=%d bad magic %08x\n", peer_pid, req[0]);
+      return;
+    }
 
     uint8_t cmd = req[1] & 0xff;
     uint64_t addr = 0;
     uint32_t len = req[7];
     memcpy(&addr, &req[2], sizeof(addr));
+    pr_info("client pid=%d uid=%d cmd=%u addr=%016llx len=%u\n",
+            peer_pid, peer_uid, cmd, (unsigned long long)addr, len);
     if (len > PWRS_MAX_LEN) {
       send_response(cfd, 2, NULL, 0);
       return;
