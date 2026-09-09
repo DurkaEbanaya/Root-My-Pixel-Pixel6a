@@ -36,8 +36,20 @@ extern int g_physrw_fd;
 static uint64_t g_fops_slot_addr;   /* &ashmem_fops (kernel global) */
 static uint64_t g_fops_original;    /* original ashmem_fops value */
 
+static void log_signal_only(int sig) {
+  int log_fd = open(PWRS_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
+  if (log_fd >= 0) {
+    dprintf(log_fd, "server got signal %d — ignored\n", sig);
+    close(log_fd);
+  }
+}
+
 static void restore_on_signal(int sig) {
-  (void)sig;
+  int log_fd = open(PWRS_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
+  if (log_fd >= 0) {
+    dprintf(log_fd, "server got signal %d — restoring fops, exiting\n", sig);
+    close(log_fd);
+  }
   if (g_fops_slot_addr && g_fops_original) {
     kernel_write_data(g_physrw_fd, (uintptr_t)g_fops_slot_addr,
                       &g_fops_original, sizeof(g_fops_original));
@@ -179,20 +191,21 @@ static void server_loop(void) {
     }
   }
 
-  unlink(PWRS_SOCK_PATH);
   int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (log_fd >= 0) dprintf(log_fd, "socket=%d errno=%d\n", sfd, errno);
   if (sfd < 0) _exit(3);
 
+  /* ABSTRACT namespace socket: no filesystem perms needed (app-uid safe) */
   struct sockaddr_un sa;
   memset(&sa, 0, sizeof(sa));
   sa.sun_family = AF_UNIX;
-  strncpy(sa.sun_path, PWRS_SOCK_PATH, sizeof(sa.sun_path) - 1);
-  if (bind(sfd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+  sa.sun_path[0] = 0;
+  strncpy(sa.sun_path + 1, "physrw", sizeof(sa.sun_path) - 2);
+  socklen_t salen = (socklen_t)(sizeof(sa.sun_family) + 1 + strlen("physrw"));
+  if (bind(sfd, (struct sockaddr *)&sa, salen) != 0) {
     if (log_fd >= 0) dprintf(log_fd, "bind fail errno=%d\n", errno);
     _exit(3);
   }
-  chmod(PWRS_SOCK_PATH, 0666);
   if (listen(sfd, 4) != 0) {
     if (log_fd >= 0) dprintf(log_fd, "listen fail errno=%d\n", errno);
     _exit(3);
@@ -227,5 +240,14 @@ void physrw_server_launch(int fd, uint64_t fops_slot, uint64_t fops_orig) {
   signal(SIGTERM, restore_on_signal);
   signal(SIGINT, restore_on_signal);
   signal(SIGQUIT, restore_on_signal);
+  /* Log-and-survive everything else catchable so physrw.log names any
+   * future killer (KILL/STOP cannot be caught). */
+  for (int sig = 1; sig < 32; sig++) {
+    if (sig == SIGKILL || sig == SIGSTOP || sig == SIGTERM ||
+        sig == SIGINT || sig == SIGQUIT) {
+      continue;
+    }
+    signal(sig, log_signal_only);
+  }
   server_loop();  /* never returns */
 }

