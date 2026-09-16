@@ -57,7 +57,8 @@ int spawn_root_child(void) {
     uid_t captured_ppid = (uid_t)getppid();
     char rmguidbuf[32];
     snprintf(rmguidbuf, sizeof(rmguidbuf), "%u", (unsigned)captured_uid_before);
-    setenv("RMG_CLIENT_UID", rmguidbuf, 1);
+    setenv("RMG_CLIENT_UID", rmguidbuf, 0);
+    setenv("RMG_APP_UID", rmguidbuf, 0);
 
     for (int i = 0; i < 60000; i++) {
       if (atomic_load(&root_shared->go)) {

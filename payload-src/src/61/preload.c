@@ -415,6 +415,12 @@ int install_embedded_su(pid_t *daemon_pid) {
   for (int i = 0; i < 50; i++) {
     if (access(SU_SOCK, F_OK) == 0) {
       pr_success("embedded su daemon ready pid=%d socket=%s\n", pid, SU_SOCK);
+      /* Relabel socket + client for shell access under enforcing (we are
+         permissive right now, so chcon succeeds). */
+      system("chcon u:object_r:shell_data_file:s0 " SU_SOCK
+             " /data/local/tmp/su " SU_DST "/su >/dev/null 2>&1");
+      system("sh /data/data/com.rootkeeper/files/rk/post_root.sh"
+             " >/dev/null 2>&1 &");
       return 1;
     }
     usleep(100000);
