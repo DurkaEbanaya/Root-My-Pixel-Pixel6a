@@ -287,6 +287,20 @@ static void server_loop(void) {
 }
 
 void physrw_server_launch(int fd, uint64_t fops_slot, uint64_t fops_orig) {
+  /* E63: lmkd armor for the server process itself — the parent armor
+   * does not cover this process; an unarmored uid-2000 server is a top
+   * SIGKILL target under memory pressure. */
+  {
+    char op[64];
+    snprintf(op, sizeof(op), "/proc/%d/oom_score_adj", (int)getpid());
+    int ofd = open(op, O_WRONLY | O_CLOEXEC);
+    if (ofd >= 0) {
+      ssize_t w = write(ofd, "-1000", 5);
+      dprintf(2, "server oom armor self pid=%d ret=%d errno=%d\n",
+              (int)getpid(), (int)w, w == 5 ? 0 : errno);
+      close(ofd);
+    }
+  }
   g_physrw_fd = fd;
   g_fops_slot_addr = fops_slot;
   g_fops_original = fops_orig;
