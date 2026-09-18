@@ -384,10 +384,18 @@ static int kernelsu_loaded(void) {
   return found;
 }
 
+/* Run one ksud stage (stages are idempotent in ksud, just execute them). */
+static int run_stage_direct(const char *ksud, const char *stage) {
+  char cmd[600];
+  snprintf(cmd, sizeof(cmd), "%s %s", ksud, stage);
+  return run_shell(cmd);
+}
+
 int ksu_full_main(int argc, char **argv) {
   (void)argc;
   const char *ksud = argc >= 3 ? argv[2] : "/data/local/tmp/ksud";
   const char *log = argc >= 4 ? argv[3] : "/data/local/tmp/exploit.log";
+  int rc = 0;
   (void)ksud;
 
   uint64_t slide = 0;
@@ -496,11 +504,22 @@ int ksu_full_main(int argc, char **argv) {
              ksud_paths[i]);
     int mrc = run_shell(mcmd);
     ksu_log("[*] ksu-full: post-fs-data rc=%d\n", mrc);
+    /* The remaining boot stages run module service.sh / boot-completed.sh
+     * scripts, load module sepolicy.rules and system.prop — needed by any
+     * module that is more than plain file replacement. Run them from this
+     * same ksu:s0 + PID1-ns context (non-blocking on the KSU boot flow;
+     * we block because the caller wants a definitive result). */
+    int src1 = run_stage_direct(ksud_paths[i], "services");
+    ksu_log("[*] ksu-full: services rc=%d\n", src1);
+    int src2 = run_stage_direct(ksud_paths[i], "boot-completed");
+    ksu_log("[*] ksu-full: boot-completed rc=%d\n", src2);
+    rc |= (src1 != 0) | (src2 != 0 ? 2 : 0);
     break;
   }
   ksu_log("[+] ksu-full: SUCCESS — KernelSU-Next is live\n");
-  return 0;
+  return rc;
 }
+
 
 int ksu_mount_main(int argc, char **argv) {
   (void)argc;
