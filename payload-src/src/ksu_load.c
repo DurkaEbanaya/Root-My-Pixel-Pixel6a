@@ -29,6 +29,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sched.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -55,6 +57,8 @@ static int ksu_log(const char *fmt, ...) {
 
 /* ---------------------------------------------------------------- helpers */
 
+static int run_shell(const char *cmd);
+
 /* Execute `sh -c cmd` as root through the temp_su daemon by re-invoking
  * this binary as its su client. The daemon concatenates argv with spaces
  * and runs `sh -c "<joined>"`, so the command must arrive as a single
@@ -71,6 +75,13 @@ static int run_root(const char *cmd) {
   if (strchr(cmd, '\'')) {
     ksu_log("[-] ksu-full: refusing command with quote: %s\n", cmd);
     return -1;
+  }
+
+  /* Already root (e.g. --ksu-full invoked through temp_su): run directly.
+   * The daemon socket only accepts UID 2000 / app clients, so looping back
+   * through it from a root process fails with EPERM. */
+  if (geteuid() == 0) {
+    return run_shell(cmd);
   }
 
   char quoted[1024];
@@ -343,18 +354,41 @@ static int run_shell(const char *cmd) {
   return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-/* Run one ksud boot stage via `ksud debug su` (post-enforcing path). */
-static int run_stage_ksu(const char *ksud, const char *stage) {
-  char cmd[512];
-  snprintf(cmd, sizeof(cmd), "echo '%s %s' | '%s' debug su", ksud, stage, ksud);
-  int rc = run_shell(cmd);
-  ksu_log("[*] ksu-full: %s rc=%d\n", stage, rc);
-  return rc;
+/* Check /proc/modules directly from this process (no child sh). A child
+ * grep can be blocked by SELinux once KSUN re-enables enforcing while our
+ * process still carries the kernel:s0 context; direct reads of procfs
+ * succeeded in live testing from both kernel:s0 (permissive) and ksu:s0. */
+static int kernelsu_loaded(void) {
+  int fd = open("/proc/modules", O_RDONLY);
+  if (fd < 0) {
+    return 0;
+  }
+  char buf[4096];
+  int found = 0;
+  for (;;) {
+    ssize_t r = read(fd, buf, sizeof(buf));
+    if (r <= 0) {
+      break;
+    }
+    for (ssize_t i = 0; i + 8 <= r; i++) {
+      if (memcmp(buf + i, "kernelsu", 8) == 0) {
+        found = 1;
+        break;
+      }
+    }
+    if (found) {
+      break;
+    }
+  }
+  close(fd);
+  return found;
 }
 
 int ksu_full_main(int argc, char **argv) {
+  (void)argc;
   const char *ksud = argc >= 3 ? argv[2] : "/data/local/tmp/ksud";
   const char *log = argc >= 4 ? argv[3] : "/data/local/tmp/exploit.log";
+  (void)ksud;
 
   uint64_t slide = 0;
   if (parse_slide(log, &slide) != 0) {
@@ -369,38 +403,111 @@ int ksu_full_main(int argc, char **argv) {
   ksu_log("[+] ksu-full: patched %d imports -> %s\n", patched,
           PATCHED_KO_PATH);
 
-  if (run_root("insmod " PATCHED_KO_PATH " allow_shell=1") != 0) {
-    ksu_log("[-] ksu-full: insmod failed\n");
+  if (kernelsu_loaded()) {
+    ksu_log("[+] ksu-full: kernelsu already loaded, skipping insmod\n");
+    return 0;
+  }
+
+  /* Load the module with a DIRECT init_module(2) syscall from THIS process
+   * (no /system/bin/insmod, no sh child). KSUN's late-load init path runs
+   * escape_to_root_for_init() on `current` — the process executing the
+   * module init — BEFORE it flips enforcing. So after the syscall returns
+   * THIS helper is already uid0 in u:r:ksu:s0 and can still exec binaries
+   * under /data, which neither kernel:s0 nor untrusted_app can do under
+   * enforcing. A `sh -c insmod` child would receive the escape instead and
+   * this process would stay kernel:s0 (validated: it lost all exec on
+   * /data after insmod). */
+  size_t ko_len = 0;
+  unsigned char *ko_img = NULL;
+  int kfd = open(PATCHED_KO_PATH, O_RDONLY);
+  if (kfd < 0) {
+    ksu_log("[-] ksu-full: cannot read %s\n", PATCHED_KO_PATH);
     return 4;
   }
-  ksu_log("[+] ksu-full: kernelsu module loaded\n");
-
-  /* From here KSUN enforces SELinux again and the temp_su daemon socket is
-   * blocked for shell — run the boot stages through ksud's own su. */
-  int rc = 0;
-  rc |= run_stage_ksu(ksud, "post-fs-data");
-  rc |= run_stage_ksu(ksud, "services");
-  rc |= run_stage_ksu(ksud, "boot-completed");
-
-  /* restart the manager so it picks up the freshly loaded module */
-  char cmd[256];
-  snprintf(cmd, sizeof(cmd),
-           "am force-stop " MANAGER_PKG " ; am start -n " MANAGER_ACTIVITY
-           " || true");
-  run_shell(cmd);
-
-  if (run_shell("grep -q kernelsu /proc/modules") == 0) {
-    ksu_log("[+] ksu-full: SUCCESS — KernelSU-Next is live\n");
-    return rc;
+  struct stat kst;
+  if (fstat(kfd, &kst) != 0 || kst.st_size <= 0) {
+    close(kfd);
+    ksu_log("[-] ksu-full: stat %s failed\n", PATCHED_KO_PATH);
+    return 4;
   }
-  ksu_log("[-] ksu-full: module check failed\n");
-  return 5;
+  ko_len = (size_t)kst.st_size;
+  ko_img = malloc(ko_len);
+  if (!ko_img) {
+    close(kfd);
+    return 4;
+  }
+  size_t kdone = 0;
+  while (kdone < ko_len) {
+    ssize_t k = read(kfd, ko_img + kdone, ko_len - kdone);
+    if (k <= 0) {
+      close(kfd);
+      free(ko_img);
+      return 4;
+    }
+    kdone += (size_t)k;
+  }
+  close(kfd);
+
+  if (syscall(__NR_init_module, ko_img, ko_len, "allow_shell=1") != 0) {
+    /* EEXIST means the module is already live (retry loop). Anything else
+     * is a real failure; no staged mount must be attempted either way
+     * before the module UAPI exists (ksud would silently skip: "UAPI
+     * version mismatch: kernel=0"). */
+    int e = errno;
+    free(ko_img);
+    if (e != EEXIST) {
+      ksu_log("[-] ksu-full: init_module failed: %s\n", strerror(e));
+      return 4;
+    }
+    ksu_log("[*] ksu-full: module already loaded (EEXIST)\n");
+  } else {
+    free(ko_img);
+    ksu_log("[+] ksu-full: init_module ok — helper escaped to KSU domain\n");
+  }
+
+  /* THIS process now holds u:r:ksu:s0 (escape happened inside init_module).
+   * ksud stages COULD NOT run before the module was loaded (UAPI probe
+   * returned kernel=0 and ksud skipped on_post_data_fs with rc=0 — a false
+   * success). Run the canonical mount pipeline now, from the escaped
+   * process, with a double-stack guard. /data/adb/ksud is deployed by
+   * prepareAssets()/earlier ksud runs; fall back to /data/local/tmp.
+   * ALSO: enter PID 1's mount namespace first. The temp_su daemon lives in
+   * a SLAVE mount ns (master:1): mounts made there stay invisible to the
+   * system (validated live — overlay existed only in the daemon's ns).
+   * PID 1's ns is shared:1, so mounts from there propagate everywhere. */
+  int nsfd = open("/proc/1/ns/mnt", O_RDONLY);
+  if (nsfd >= 0) {
+    if (setns(nsfd, CLONE_NEWNS) != 0) {
+      ksu_log("[*] ksu-full: setns(PID1 mnt) failed: %s\n", strerror(errno));
+    } else {
+      ksu_log("[*] ksu-full: entered PID1 mount ns\n");
+    }
+    close(nsfd);
+  }
+  const char *ksud_paths[] = {"/data/adb/ksud", ksud};
+  for (int i = 0; i < 2; i++) {
+    struct stat sst;
+    if (stat(ksud_paths[i], &sst) != 0 || !(sst.st_mode & S_IXUSR)) {
+      continue;
+    }
+    char mcmd[600];
+    snprintf(mcmd, sizeof(mcmd),
+             "grep -q \"overlay KSU\" /proc/1/mountinfo || %s post-fs-data",
+             ksud_paths[i]);
+    int mrc = run_shell(mcmd);
+    ksu_log("[*] ksu-full: post-fs-data rc=%d\n", mrc);
+    break;
+  }
+  ksu_log("[+] ksu-full: SUCCESS — KernelSU-Next is live\n");
+  return 0;
 }
 
 int ksu_mount_main(int argc, char **argv) {
-  const char *ksud = argc >= 3 ? argv[2] : "/data/local/tmp/ksud";
-  int rc = run_stage_ksu(ksud, "post-fs-data");
-  rc |= run_stage_ksu(ksud, "services");
-  rc |= run_stage_ksu(ksud, "boot-completed");
-  return rc;
+  (void)argc;
+  (void)argv;
+  /* Stage replay must run from a KSU-flagged process (UID 2000/app via
+   * `ksud debug su`), not from kernel:s0 — see ksu_full_main. The caller
+   * (keeper_apk.sh) runs the stages itself. */
+  ksu_log("[-] ksu-mount: stages are run by the caller via ksud debug su\n");
+  return 0;
 }
